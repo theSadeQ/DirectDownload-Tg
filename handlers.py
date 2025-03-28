@@ -1,7 +1,7 @@
 # handlers.py
 # Contains PTB handlers, conversation logic, and the reporting helper.
 # MODIFIED: Removed cf_clearance/cookie prompts. Access config via context.
-# FIXED: SyntaxErrors in start_download_conv and cancel functions.
+# FIXED: SyntaxErrors. Fixed TypeError in fallbacks.
 
 import logging
 import asyncio
@@ -34,7 +34,7 @@ from downloaders import (
 
 logger = logging.getLogger(__name__)
 
-# --- Conversation States (Unchanged) ---
+# --- Conversation States ---
 CHOOSE_DOWNLOADER, GET_URLS, GET_FILENAMES_NZB, \
 GET_FILENAMES_DELTA, CONFIRM_DELTA_FN, \
 GET_URLS_BITSO, GET_FILENAMES_BITSO = range(7)
@@ -68,43 +68,31 @@ async def run_and_report_process(update: Update, context: ContextTypes.DEFAULT_T
             await context.bot.send_message(chat_id, f"🚨 Error after <b>{service_name}</b>.\nError: <pre>{error_text[:500]}</pre>", parse_mode=ParseMode.HTML)
         except Exception as send_error: logger.error(f"Failed send final error msg {chat_id}: {send_error}")
 
-# --- Simple Command Handlers ---
+# --- Simple Command Handlers (Unchanged) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """ Sends welcome message, gets config from context. """
     user = update.effective_user
-    # Get config from context stored in bot.py/Cell 3
     upload_enabled = context.bot_data.get('upload_enabled', True)
     upload_mode = context.bot_data.get('upload_mode', 'N/A')
     delete_after_upload = context.bot_data.get('delete_after_upload', True)
     cred_status = "API/Token Configured." if context.bot_data.get('pyrogram_client') else "⚠️ API/Token Error!"
     upload_status = f"✅ Uploads ON (Mode: {upload_mode})." if upload_enabled else "ℹ️ Uploads OFF."
     delete_status = f"🗑️ Delete ON." if upload_enabled and delete_after_upload else "💾 Delete OFF."
-
     await update.message.reply_html(
         rf"Hi {user.mention_html()}!"
-        f"\n\n{cred_status}"
-        f"\n{upload_status}"
-        f"\n{delete_status}"
+        f"\n\n{cred_status}" f"\n{upload_status}" f"\n{delete_status}"
         f"\n\nUse /download to start.",
     )
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """ Cancels and ends the conversation. """
     user_id = update.effective_user.id if update.effective_user else "Unknown"; logger.info(f"User {user_id} cancelled.")
     message_text = "Download process cancelled."; query = update.callback_query
     try:
-        if query:
-            await query.answer()
-            await query.edit_message_text(message_text)
-        elif update.message:
-            await update.message.reply_text(message_text)
+        if query: await query.answer(); await query.edit_message_text(message_text)
+        elif update.message: await update.message.reply_text(message_text)
     except Exception as e:
         logger.warning(f"Failed send/edit cancel confirmation: {e}")
-        # Nested try/except for sending fallback message
-        try:
-            await context.bot.send_message(update.effective_chat.id, message_text)
-        except Exception as send_e:
-            logger.error(f"Failed sending cancel confirmation fallback: {send_e}")
+        try: await context.bot.send_message(update.effective_chat.id, message_text)
+        except Exception as send_e: logger.error(f"Failed sending cancel confirm: {send_e}")
     context.user_data.clear(); return ConversationHandler.END
 
 # --- Conversation Handlers ---
@@ -114,7 +102,6 @@ async def _process_urls_and_proceed(urls: list[str], update: Update, context: Co
     """ Stores valid URLs, logs, determines next step based on downloader. """
     if not urls:
         await update.message.reply_text("⚠️ No valid HTTP(S) URLs found. Send again or /cancel.")
-        # Stay in the current state
         current_downloader = context.user_data.get('downloader')
         if current_downloader == 'bitso': return GET_URLS_BITSO
         else: return GET_URLS
@@ -127,7 +114,7 @@ async def _process_urls_and_proceed(urls: list[str], update: Update, context: Co
         await update.message.reply_text(f"✅ Got {len(urls)} URL(s).\nSend FN(s):")
         return GET_FILENAMES_NZB
     elif downloader == 'deltaleech':
-        kb = [[InlineKeyboardButton("Extract FNs", cd='delta_use_url_fn')],[InlineKeyboardButton("Provide FNs", cd='delta_manual_fn')],[InlineKeyboardButton("Cancel", cd='cancel')]]
+        kb = [[InlineKeyboardButton("Extract FNs", callback_data='delta_use_url_fn')],[InlineKeyboardButton("Provide FNs", callback_data='delta_manual_fn')],[InlineKeyboardButton("Cancel", callback_data='cancel')]]
         await update.message.reply_text(f"✅ Got {len(urls)} URL(s).\nFilenames?", reply_markup=InlineKeyboardMarkup(kb))
         return CONFIRM_DELTA_FN
     elif downloader == 'bitso':
@@ -177,25 +164,22 @@ async def handle_url_file(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     current_state = GET_URLS_BITSO if current_downloader == 'bitso' else GET_URLS
 
     if not doc or not doc.file_name or not doc.file_name.lower().endswith(".txt"):
-        await update.message.reply_text("Please upload `.txt` file with URLs (one per line).")
+        await update.message.reply_text("Please upload a `.txt` file.")
         return current_state
 
     MAX_TXT_SIZE = 1 * 1024 * 1024
     if doc.file_size > MAX_TXT_SIZE:
-        await update.message.reply_text(f"❌ File >{MAX_TXT_SIZE/1024/1024:.0f}MB. Send smaller .txt file.")
+        await update.message.reply_text(f"❌ File >{MAX_TXT_SIZE/1024/1024:.0f}MB.")
         return current_state
 
     try:
         txt_file = await context.bot.get_file(doc.file_id)
         file_content_bytes = await txt_file.download_as_bytearray()
-        try:
-            file_content_str = file_content_bytes.decode('utf-8')
-        except UnicodeDecodeError:
-            await update.message.reply_text("❌ Error decoding file as UTF-8.")
-            return current_state
+        try: file_content_str = file_content_bytes.decode('utf-8')
+        except UnicodeDecodeError: await update.message.reply_text("❌ Error decoding file as UTF-8."); return current_state
 
         urls = [url for url in file_content_str.splitlines() if url.strip().lower().startswith(('http://', 'https://'))]
-        logger.info(f"Extracted {len(urls)} URLs from file '{doc.file_name}'.")
+        logger.info(f"Extracted {len(urls)} URLs from '{doc.file_name}'.")
         return await _process_urls_and_proceed(urls, update, context)
     except Exception as e:
         logger.error(f"Error processing URL file: {e}", exc_info=True)
@@ -203,9 +187,8 @@ async def handle_url_file(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return current_state
 
 
-# --- Other Conversation Handlers (Unchanged from previous version) ---
+# --- Other Conversation Handlers (Unchanged) ---
 async def confirm_delta_filenames(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # ... (function unchanged) ...
     query = update.callback_query; await query.answer(); choice = query.data; urls = context.user_data['urls']
     if choice == 'cancel': return await cancel(update, context)
     if choice == 'delta_use_url_fn':
@@ -222,7 +205,6 @@ async def confirm_delta_filenames(update: Update, context: ContextTypes.DEFAULT_
     else: return ConversationHandler.END
 
 async def get_filenames_nzb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # ... (function unchanged) ...
     fns_raw=[fn.strip() for fn in update.message.text.splitlines() if fn.strip()]; urls=context.user_data['urls']
     if not fns_raw: await update.message.reply_text("⚠️ No FNs. Send again or /cancel."); return GET_FILENAMES_NZB
     if len(urls)!=len(fns_raw): await update.message.reply_text(f"❌ Error: {len(fns_raw)} FNs != {len(urls)} URLs."); return GET_FILENAMES_NZB
@@ -234,7 +216,6 @@ async def get_filenames_nzb(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     context.user_data.clear(); return ConversationHandler.END
 
 async def get_filenames_delta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # ... (function unchanged) ...
     fns_raw=[fn.strip() for fn in update.message.text.splitlines() if fn.strip()]; urls=context.user_data['urls']
     if not fns_raw: await update.message.reply_text("⚠️ No FNs. Send again or /cancel."); return GET_FILENAMES_DELTA
     if len(urls)!=len(fns_raw): await update.message.reply_text(f"❌ Error: {len(fns_raw)} FNs != {len(urls)} URLs."); return GET_FILENAMES_DELTA
@@ -246,7 +227,6 @@ async def get_filenames_delta(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data.clear(); return ConversationHandler.END
 
 async def get_filenames_bitso(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # ... (function unchanged) ...
     fns_raw=[fn.strip() for fn in update.message.text.splitlines() if fn.strip()]; urls=context.user_data['urls']
     if not fns_raw: await update.message.reply_text("⚠️ No FNs. Send again or /cancel."); return GET_FILENAMES_BITSO
     if len(urls)!=len(fns_raw): await update.message.reply_text(f"❌ Error: {len(fns_raw)} FNs != {len(urls)} URLs."); return GET_FILENAMES_BITSO
@@ -258,18 +238,18 @@ async def get_filenames_bitso(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data.clear(); return ConversationHandler.END
 
 
-# --- Build Conversation Handler (Updated state list) ---
+# --- Build Conversation Handler (Updated fallbacks) ---
 conv_handler = ConversationHandler(
     entry_points=[CommandHandler("download", start_download_conv)],
     states={
         CHOOSE_DOWNLOADER: [CallbackQueryHandler(choose_downloader, pattern='^(nzbcloud|deltaleech|bitso|cancel)$')],
         GET_URLS: [
             MessageHandler(filters.TEXT & ~filters.COMMAND, get_urls),
-            MessageHandler(filters.Document.TXT, handle_url_file), # Accept .txt file
+            MessageHandler(filters.Document.TXT, handle_url_file),
         ],
         GET_URLS_BITSO: [
             MessageHandler(filters.TEXT & ~filters.COMMAND, get_urls_bitso),
-            MessageHandler(filters.Document.TXT, handle_url_file), # Accept .txt file
+            MessageHandler(filters.Document.TXT, handle_url_file),
         ],
         CONFIRM_DELTA_FN: [CallbackQueryHandler(confirm_delta_filenames, pattern='^(delta_use_url_fn|delta_manual_fn|cancel)$')],
         GET_FILENAMES_NZB: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_filenames_nzb)],
@@ -278,7 +258,8 @@ conv_handler = ConversationHandler(
     },
     fallbacks=[
         CommandHandler("cancel", cancel), CallbackQueryHandler(cancel, pattern='^cancel$'),
-        MessageHandler(filters.Document & filters.ChatType.PRIVATE, lambda u,c: u.message.reply_text("Unexpected file. /cancel?")),
+        # Corrected fallback for unexpected documents
+        MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, lambda u,c: u.message.reply_text("Unexpected file. /cancel?")),
         MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u,c: u.message.reply_text("Unexpected input. /cancel?")),
         MessageHandler(filters.COMMAND, lambda u,c: u.message.reply_text("Finish or /cancel first.")),
     ],
