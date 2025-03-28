@@ -1,7 +1,7 @@
 # handlers.py
 # Contains PTB handlers, conversation logic, and the reporting helper.
-# Includes Bitso filename choice, assumes config access via context.
-# Includes fixes for SyntaxErrors.
+# Includes Bitso filename choice, styling for manual filenames.
+# FIXED: TypeError using cd= instead of callback_data= for Bitso keyboard.
 
 import logging
 import asyncio
@@ -24,7 +24,7 @@ from utils import (
     extract_filename_from_url,
     clean_filename,
     write_failed_downloads_to_file,
-    apply_dot_style # For manual filename styling
+    apply_dot_style
 )
 # Import downloaders
 from downloaders import (
@@ -43,7 +43,7 @@ GET_URLS_BITSO, CONFIRM_BITSO_FN, GET_FILENAMES_BITSO = range(8)
 
 # --- Helper for Running and Reporting ---
 async def run_and_report_process(update: Update, context: ContextTypes.DEFAULT_TYPE, download_upload_task, service_name: str):
-    # ... (function body unchanged) ...
+    # ... (function unchanged) ...
     chat_id = update.effective_chat.id; failed_sources = []
     download_dir = context.bot_data.get('download_dir', '/content/downloads')
     try:
@@ -76,32 +76,59 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_html(rf"Hi {user.mention_html()}!\n\n{cred_status}\n{upload_status}\n{delete_status}\n\nUse /download to start.",)
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # ... (function unchanged, includes previous fix) ...
+    # ... (function unchanged) ...
     user_id = update.effective_user.id if update.effective_user else "Unknown"; logger.info(f"User {user_id} cancelled.")
     message_text = "Download process cancelled."; query = update.callback_query
     try:
         if query: await query.answer(); await query.edit_message_text(message_text)
         elif update.message: await update.message.reply_text(message_text)
-    except Exception as e:
-        logger.warning(f"Failed send/edit cancel confirmation: {e}")
-        try: await context.bot.send_message(update.effective_chat.id, message_text)
-        except Exception as send_e: logger.error(f"Failed sending cancel confirmation fallback: {send_e}")
+    except Exception as e: logger.warning(f"Failed send/edit cancel confirm: {e}"); try: await context.bot.send_message(update.effective_chat.id, message_text)
+    except Exception as send_e: logger.error(f"Failed sending cancel confirm fallback: {send_e}")
     context.user_data.clear(); return ConversationHandler.END
 
 # --- Conversation Handlers ---
 
-# Helper Function to process URLs (Unchanged)
+# Helper Function to process URLs
 async def _process_urls_and_proceed(urls: list[str], update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # ... (function unchanged) ...
-    if not urls: await update.message.reply_text("⚠️ No valid HTTP(S) URLs found. Send again or /cancel."); current_downloader = context.user_data.get('downloader'); return GET_URLS_BITSO if current_downloader == 'bitso' else GET_URLS
-    context.user_data['urls'] = urls; downloader = context.user_data.get('downloader', 'N/A'); logger.info(f"Processed {len(urls)} URLs for {downloader}.")
-    if downloader == 'nzbcloud': await update.message.reply_text(f"✅ Got {len(urls)} URL(s).\nSend FN(s):"); return GET_FILENAMES_NZB
-    elif downloader == 'deltaleech': kb = [[InlineKeyboardButton("Extract FNs", cd='delta_use_url_fn')],[InlineKeyboardButton("Provide FNs", cd='delta_manual_fn')],[InlineKeyboardButton("Cancel", cd='cancel')]]; await update.message.reply_text(f"✅ Got {len(urls)} URL(s).\nFilenames?", reply_markup=InlineKeyboardMarkup(kb)); return CONFIRM_DELTA_FN
-    elif downloader == 'bitso': kb = [[InlineKeyboardButton("Yes, from URLs", cd='bitso_use_url_fn')],[InlineKeyboardButton("No, provide", cd='bitso_manual_fn')],[InlineKeyboardButton("Cancel", cd='cancel')]]; await update.message.reply_text(f"✅ Got {len(urls)} URL(s).\nExtract filenames?", reply_markup=InlineKeyboardMarkup(kb)); return CONFIRM_BITSO_FN
-    else: logger.error(f"Unknown downloader '{downloader}'."); await update.message.reply_text("Internal error."); return ConversationHandler.END
+    """ Stores valid URLs, logs, determines next step based on downloader. """
+    if not urls:
+        await update.message.reply_text("⚠️ No valid HTTP(S) URLs found. Send again or /cancel.")
+        current_downloader = context.user_data.get('downloader')
+        if current_downloader == 'bitso': return GET_URLS_BITSO
+        else: return GET_URLS
+
+    context.user_data['urls'] = urls
+    downloader = context.user_data.get('downloader', 'N/A')
+    logger.info(f"Processed {len(urls)} URLs for {downloader}.")
+
+    if downloader == 'nzbcloud':
+        await update.message.reply_text(f"✅ Got {len(urls)} URL(s).\nSend FN(s):")
+        return GET_FILENAMES_NZB
+    elif downloader == 'deltaleech':
+        kb = [
+            [InlineKeyboardButton("Extract FNs", callback_data='delta_use_url_fn')],
+            [InlineKeyboardButton("Provide FNs", callback_data='delta_manual_fn')],
+            [InlineKeyboardButton("Cancel", callback_data='cancel')]
+        ]
+        await update.message.reply_text(f"✅ Got {len(urls)} URL(s).\nFilenames?", reply_markup=InlineKeyboardMarkup(kb))
+        return CONFIRM_DELTA_FN
+    elif downloader == 'bitso':
+         # ***** CORRECTED KEYBOARD *****
+         kb = [
+             [InlineKeyboardButton("Yes, from URLs", callback_data='bitso_use_url_fn')],
+             [InlineKeyboardButton("No, provide", callback_data='bitso_manual_fn')],
+             [InlineKeyboardButton("Cancel", callback_data='cancel')]
+         ]
+         # ***** END CORRECTION *****
+         await update.message.reply_text(f"✅ Got {len(urls)} URL(s).\nExtract filenames?", reply_markup=InlineKeyboardMarkup(kb))
+         return CONFIRM_BITSO_FN # Transition to new state
+    else:
+        logger.error(f"Unknown downloader '{downloader}' in _process_urls.")
+        await update.message.reply_text("Internal error. /cancel")
+        return ConversationHandler.END
 
 async def start_download_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-     # ... (function unchanged, includes previous fix) ...
+     # ... (function unchanged) ...
      if 'pyrogram_client' not in context.bot_data: await update.message.reply_text("⚠️ Bot init error."); return ConversationHandler.END
      kb = [[InlineKeyboardButton(s, callback_data=s.lower().split()[1]) for s in ["☁️ nzbCloud", "💧 DeltaLeech", "🪙 Bitso"]], [InlineKeyboardButton("❌ Cancel", callback_data='cancel')]]
      await update.message.reply_text("Choose service:", reply_markup=InlineKeyboardMarkup(kb)); return CHOOSE_DOWNLOADER
@@ -115,26 +142,23 @@ async def choose_downloader(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     elif downloader == 'bitso': return GET_URLS_BITSO
     else: await query.edit_message_text("Error."); return ConversationHandler.END
 
-# Handles text/file input for URLs (nzb/delta)
+# Handles text/file input (Unchanged)
 async def get_urls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    logger.info("Handling text in GET_URLS state."); urls = [url for url in update.message.text.splitlines() if url.strip().lower().startswith(('http://', 'https://'))]; return await _process_urls_and_proceed(urls, update, context)
+    logger.info("Handling text in GET_URLS."); urls = [url for url in update.message.text.splitlines() if url.strip().lower().startswith(('http://', 'https://'))]; return await _process_urls_and_proceed(urls, update, context)
 async def get_urls_bitso(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    logger.info("Handling text in GET_URLS_BITSO state."); urls = [url for url in update.message.text.splitlines() if url.strip().lower().startswith(('http://', 'https://'))]; return await _process_urls_and_proceed(urls, update, context)
+    logger.info("Handling text in GET_URLS_BITSO."); urls = [url for url in update.message.text.splitlines() if url.strip().lower().startswith(('http://', 'https://'))]; return await _process_urls_and_proceed(urls, update, context)
 async def handle_url_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # ... (function unchanged) ...
-    logger.info("Handling document while expecting URLs."); doc = update.message.document; current_downloader = context.user_data.get('downloader'); current_state = GET_URLS_BITSO if current_downloader == 'bitso' else GET_URLS
+    logger.info("Handling document."); doc = update.message.document; current_downloader = context.user_data.get('downloader'); current_state = GET_URLS_BITSO if current_downloader == 'bitso' else GET_URLS
     if not doc or not doc.file_name or not doc.file_name.lower().endswith(".txt"): await update.message.reply_text("Please upload `.txt` file."); return current_state
     MAX_TXT_SIZE = 1*1024*1024;
     if doc.file_size > MAX_TXT_SIZE: await update.message.reply_text(f"❌ File >{MAX_TXT_SIZE/1024/1024:.0f}MB."); return current_state
-    try:
-        txt_file = await context.bot.get_file(doc.file_id); file_content_bytes = await txt_file.download_as_bytearray()
-        try: file_content_str = file_content_bytes.decode('utf-8')
-        except UnicodeDecodeError: await update.message.reply_text("❌ Error decoding file as UTF-8."); return current_state
-        urls = [url for url in file_content_str.splitlines() if url.strip().lower().startswith(('http://', 'https://'))]; logger.info(f"Extracted {len(urls)} URLs from '{doc.file_name}'.")
-        return await _process_urls_and_proceed(urls, update, context)
+    try: txt_file = await context.bot.get_file(doc.file_id); file_content_bytes = await txt_file.download_as_bytearray(); file_content_str = file_content_bytes.decode('utf-8')
+    except UnicodeDecodeError: await update.message.reply_text("❌ Error decoding file as UTF-8."); return current_state
     except Exception as e: logger.error(f"Error processing URL file: {e}", exc_info=True); await update.message.reply_text(f"❌ Error processing file: {e}"); return current_state
+    urls = [url for url in file_content_str.splitlines() if url.strip().lower().startswith(('http://', 'https://'))]; logger.info(f"Extracted {len(urls)} URLs from '{doc.file_name}'."); return await _process_urls_and_proceed(urls, update, context)
 
-# --- DeltaLeech Specific Handlers ---
+# --- DeltaLeech Specific Handlers (Unchanged) ---
 async def confirm_delta_filenames(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # ... (function unchanged) ...
     query = update.callback_query; await query.answer(); choice = query.data; urls = context.user_data['urls']
@@ -163,7 +187,7 @@ async def get_filenames_delta(update: Update, context: ContextTypes.DEFAULT_TYPE
     else: asyncio.create_task(run_and_report_process(update, context, download_multiple_files_deltaleech(urls, styled_fns, cf, update, context, pyro_client), "deltaleech"))
     context.user_data.clear(); return ConversationHandler.END
 
-# --- nzbCloud Specific Handlers ---
+# --- nzbCloud Specific Handlers (Unchanged) ---
 async def get_filenames_nzb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # ... (function unchanged - includes styling) ...
     fns_raw=[fn.strip() for fn in update.message.text.splitlines() if fn.strip()]; urls=context.user_data['urls']
@@ -179,46 +203,31 @@ async def get_filenames_nzb(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 # --- Bitso Specific Handlers ---
 async def confirm_bitso_filenames(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """ Handles Bitso filename choice (extract or manual). """
+    # ... (function unchanged) ...
     query = update.callback_query; await query.answer(); choice = query.data; urls = context.user_data['urls']
     if choice == 'cancel': return await cancel(update, context)
     if choice == 'bitso_use_url_fn':
-        logger.info("Attempting to extract filenames from URLs for Bitso.")
-        filenames = [extract_filename_from_url(url) for url in urls]; failed = [u for u,f in zip(urls,filenames) if f is None]; valid = [f for f in filenames if f is not None]
+        logger.info("Attempting to extract filenames from URLs for Bitso."); filenames = [extract_filename_from_url(url) for url in urls]; failed = [u for u,f in zip(urls,filenames) if f is None]; valid = [f for f in filenames if f is not None]
         if not valid: await query.edit_message_text("⚠️ Could not extract FNs. Provide manually:", parse_mode=ParseMode.HTML); return GET_FILENAMES_BITSO
         elif failed: await query.edit_message_text(f"⚠️ Failed {len(failed)} FNs (e.g.,<pre>{failed[0]}</pre>). Provide ALL manually:", parse_mode=ParseMode.HTML); return GET_FILENAMES_BITSO
-        else:
-            context.user_data['filenames'] = valid; logger.info(f"Using {len(valid)} extracted FNs for Bitso.")
-            await query.edit_message_text("✅ Using extracted FNs.\n⏳ Starting Bitso (cookies=None)...", parse_mode=ParseMode.HTML)
-            id_c=None; sess_c=None; ref_url="https://panel.bitso.ir/"; pyro_client = context.bot_data.get('pyrogram_client')
-            if not pyro_client: await context.bot.send_message(update.effective_chat.id, "🚨 Error: Cannot upload.")
-            else: asyncio.create_task(run_and_report_process(update, context, download_multiple_files_bitso(urls, valid, ref_url, id_c, sess_c, update, context, pyro_client), "bitso"))
-            context.user_data.clear(); return ConversationHandler.END
-    # ***** CORRECTED LINE *****
-    elif choice == 'bitso_manual_fn':
-        # Ensure the f-string is complete on one line
-        await query.edit_message_text(f"OK. Send the {len(urls)} filename(s), one per line, matching the URL order, or /cancel.")
-        return GET_FILENAMES_BITSO
-    # ***** END CORRECTION *****
+        else: context.user_data['filenames'] = valid; logger.info(f"Using {len(valid)} extracted FNs for Bitso."); await query.edit_message_text("✅ Using extracted FNs.\n⏳ Starting Bitso (cookies=None)...", parse_mode=ParseMode.HTML); id_c=None; sess_c=None; ref_url="https://panel.bitso.ir/"; pyro_client = context.bot_data.get('pyrogram_client')
+        if not pyro_client: await context.bot.send_message(update.effective_chat.id, "🚨 Error: Cannot upload.")
+        else: asyncio.create_task(run_and_report_process(update, context, download_multiple_files_bitso(urls, valid, ref_url, id_c, sess_c, update, context, pyro_client), "bitso"))
+        context.user_data.clear(); return ConversationHandler.END
+    elif choice == 'bitso_manual_fn': await query.edit_message_text(f"OK. Send the {len(urls)} filename(s), one per line, matching the URL order, or /cancel."); return GET_FILENAMES_BITSO
     else: return ConversationHandler.END
 
-# MODIFIED: Apply styling to manual filenames
 async def get_filenames_bitso(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """ Gets manual Bitso filenames, cleans, styles, and proceeds directly to download. """
+    # ... (function unchanged - includes styling) ...
     fns_raw=[fn.strip() for fn in update.message.text.splitlines() if fn.strip()]; urls=context.user_data['urls']
     if not fns_raw: await update.message.reply_text("⚠️ No FNs received. Send again or /cancel."); return GET_FILENAMES_BITSO
     if len(urls)!=len(fns_raw): await update.message.reply_text(f"❌ Error: {len(fns_raw)} FNs != {len(urls)} URLs."); return GET_FILENAMES_BITSO
-
-    cleaned_fns = [clean_filename(fn) for fn in fns_raw]
-    styled_fns = [apply_dot_style(fn) for fn in cleaned_fns] # Apply style
-
-    context.user_data['filenames']=styled_fns # Store styled names
-    logger.info(f"Got {len(styled_fns)} manual styled FNs for Bitso: {styled_fns[:3]}...")
-
+    cleaned_fns = [clean_filename(fn) for fn in fns_raw]; styled_fns = [apply_dot_style(fn) for fn in cleaned_fns]
+    context.user_data['filenames']=styled_fns; logger.info(f"Got {len(styled_fns)} manual styled FNs for Bitso: {styled_fns[:3]}...")
     await update.message.reply_text("✅ Got styled filenames.\n⏳ Starting Bitso process (cookies=None)...")
     id_c=None; sess_c=None; ref_url="https://panel.bitso.ir/"; pyro_client=context.bot_data.get('pyrogram_client')
     if not pyro_client: await update.message.reply_text("🚨 Error: Cannot upload.")
-    else: asyncio.create_task(run_and_report_process(update, context, download_multiple_files_bitso(urls, styled_fns, ref_url, id_c, sess_c, update, context, pyro_client), "bitso")) # Use styled_fns
+    else: asyncio.create_task(run_and_report_process(update, context, download_multiple_files_bitso(urls, styled_fns, ref_url, id_c, sess_c, update, context, pyro_client), "bitso"))
     context.user_data.clear(); return ConversationHandler.END
 
 
