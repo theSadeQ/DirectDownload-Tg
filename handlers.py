@@ -1,4 +1,6 @@
 # handlers.py
+# Contains PTB handlers, conversation logic, and the reporting helper.
+
 import logging
 import asyncio
 
@@ -12,11 +14,17 @@ from telegram.ext import (
     MessageHandler,
     filters
 )
-from telegram.constants import ParseMode
+from telegram.constants import ParseMode # Needed for run_and_report_process
 
 # Local imports
 import config # Import non-sensitive config
-from utils import extract_filename_from_url, clean_filename, run_and_report_process
+# Import utils BUT NOT run_and_report_process
+from utils import (
+    extract_filename_from_url,
+    clean_filename,
+    write_failed_downloads_to_file # Needed by run_and_report_process
+)
+# Import specific downloaders needed by the conversation states
 from downloaders import (
     download_files_nzbcloud,
     download_multiple_files_deltaleech,
@@ -30,20 +38,58 @@ CHOOSE_DOWNLOADER, GET_URLS, GET_FILENAMES_NZB, GET_CF_CLEARANCE_NZB, \
 GET_FILENAMES_DELTA, GET_CF_CLEARANCE_DELTA, CONFIRM_DELTA_FN, \
 GET_URLS_BITSO, GET_FILENAMES_BITSO, GET_BITSO_COOKIES = range(10)
 
+# --- Helper for Running and Reporting (Defined HERE now) ---
+async def run_and_report_process(update: Update, context: ContextTypes.DEFAULT_TYPE, download_upload_task, service_name: str):
+    """
+    Awaits the download/upload task (which returns failed sources)
+    and reports final status/failed list via PTB context.
+    Uses config.DOWNLOAD_DIR implicitly via write_failed_downloads_to_file.
+    """
+    chat_id = update.effective_chat.id
+    failed_sources = [] # List to store source URLs that failed
+
+    try:
+        # The download/upload functions now return a list of failed source URLs
+        failed_sources = await download_upload_task
+        final_msg = f"🏁 <b>{service_name}</b> process finished."
+        logger.info(f"{service_name} process finished for chat {chat_id}.")
+
+        if failed_sources:
+            final_msg += f"\n⚠️ Encountered {len(failed_sources)} failure(s)."
+            logger.warning(f"{len(failed_sources)} failure(s) for {service_name} in chat {chat_id}.")
+            # Use config.DOWNLOAD_DIR when calling the utility
+            failed_file_path = write_failed_downloads_to_file(failed_sources, service_name, config.DOWNLOAD_DIR)
+            if failed_file_path:
+                 escaped_path = failed_file_path.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;') # Basic HTML escape
+                 final_msg += f"\nList saved to <pre>{escaped_path}</pre>"
+        else:
+            final_msg += f"\n✅🎉 All items seem to have completed successfully!"
+            logger.info(f"All {service_name} items completed successfully for chat {chat_id}.")
+
+        await context.bot.send_message(chat_id, final_msg, parse_mode=ParseMode.HTML)
+
+    except Exception as e:
+        logger.error(f"Error during the {service_name} run/report phase: {e}", exc_info=True)
+        try:
+            error_text = str(e).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;') # Basic HTML escape
+            await context.bot.send_message(chat_id, f"🚨 Unexpected error after <b>{service_name}</b> process finished.\nError: <pre>{error_text[:500]}</pre>", parse_mode=ParseMode.HTML)
+        except Exception as send_error:
+             logger.error(f"Failed to send final error message to user {chat_id}: {send_error}")
+
 
 # --- Simple Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sends a welcome message with current settings."""
     user = update.effective_user
-    # Read non-sensitive config directly
     upload_status = f"✅ Uploads ENABLED (Mode: {config.UPLOAD_MODE})." if config.UPLOAD_ENABLED else "ℹ️ Uploads DISABLED."
     delete_status = f"🗑️ Files DELETED after upload." if config.UPLOAD_ENABLED and config.DELETE_AFTER_UPLOAD else "💾 Files KEPT after upload."
-    # Removed IS_CONFIG_VALID check here - bot.py handles startup validation
+    # Basic check - assumes bot.py handles critical validation before starting
+    cred_status = "API ID/Hash configured."
 
     await update.message.reply_html(
         rf"Hi {user.mention_html()}! I can download files."
-        # f"\n\n{cred_status}" # Removed cred status check from here
-        f"\n\n{upload_status}"
+        f"\n\n{cred_status}"
+        f"\n{upload_status}"
         f"\n{delete_status}"
         f"\n\nUse /download to start.",
     )
@@ -66,7 +112,10 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 # --- Conversation Handlers ---
 async def start_download_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
      """Starts the conversation when /download is used."""
-     # Removed IS_CONFIG_VALID check here - bot.py handles startup validation
+     # Basic check if bot_data exists - validation primarily in bot.py now
+     if 'pyrogram_client' not in context.bot_data:
+          await update.message.reply_text("⚠️ Bot initialization error. Please check logs or restart.")
+          return ConversationHandler.END
      keyboard = [
         [InlineKeyboardButton("☁️ nzbCloud", callback_data='nzbcloud')],
         [InlineKeyboardButton("💧 DeltaLeech", callback_data='deltaleech')],
@@ -75,9 +124,6 @@ async def start_download_conv(update: Update, context: ContextTypes.DEFAULT_TYPE
      ]
      await update.message.reply_text("Please choose the downloader service:", reply_markup=InlineKeyboardMarkup(keyboard))
      return CHOOSE_DOWNLOADER
-
-# [ Rest of the conversation handlers (choose_downloader, get_urls, confirm_delta_filenames, etc.) remain unchanged from the previous full code response ]
-# ... (Keep the rest of the functions in handlers.py the same) ...
 
 async def choose_downloader(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query; await query.answer()
@@ -133,7 +179,9 @@ async def get_cf_clearance_nzb(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text("⏳ Starting nzbCloud process...")
     urls=context.user_data['urls']; fns=context.user_data['filenames']; pyro_client=context.bot_data.get('pyrogram_client')
     if not pyro_client: logger.error("No pyro client!"); await update.message.reply_text("🚨 Error: Cannot upload.")
-    else: asyncio.create_task(run_and_report_process(update, context, download_files_nzbcloud(urls, fns, cf, update, context, pyro_client), "nzbcloud", config.DOWNLOAD_DIR))
+    else:
+        # Call run_and_report_process defined in THIS file
+        asyncio.create_task(run_and_report_process(update, context, download_files_nzbcloud(urls, fns, cf, update, context, pyro_client), "nzbcloud"))
     context.user_data.clear(); return ConversationHandler.END
 
 async def get_cf_clearance_delta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -141,7 +189,9 @@ async def get_cf_clearance_delta(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text("⏳ Starting DeltaLeech process...")
     urls=context.user_data['urls']; fns=context.user_data['filenames']; pyro_client=context.bot_data.get('pyrogram_client')
     if not pyro_client: logger.error("No pyro client!"); await update.message.reply_text("🚨 Error: Cannot upload.")
-    else: asyncio.create_task(run_and_report_process(update, context, download_multiple_files_deltaleech(urls, fns, cf, update, context, pyro_client), "deltaleech", config.DOWNLOAD_DIR))
+    else:
+        # Call run_and_report_process defined in THIS file
+        asyncio.create_task(run_and_report_process(update, context, download_multiple_files_deltaleech(urls, fns, cf, update, context, pyro_client), "deltaleech"))
     context.user_data.clear(); return ConversationHandler.END
 
 async def get_urls_bitso(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -170,7 +220,9 @@ async def get_bitso_cookies(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     urls=context.user_data['urls']; fns=context.user_data['filenames']; pyro_client=context.bot_data.get('pyrogram_client')
     ref_url = "https://panel.bitso.ir/"
     if not pyro_client: logger.error("No pyro client!"); await update.message.reply_text("🚨 Error: Cannot upload.")
-    else: asyncio.create_task(run_and_report_process(update, context, download_multiple_files_bitso(urls, fns, ref_url, id_cookie, sess_cookie, update, context, pyro_client), "bitso", config.DOWNLOAD_DIR))
+    else:
+        # Call run_and_report_process defined in THIS file
+        asyncio.create_task(run_and_report_process(update, context, download_multiple_files_bitso(urls, fns, ref_url, id_cookie, sess_cookie, update, context, pyro_client), "bitso"))
     context.user_data.clear(); return ConversationHandler.END
 
 
@@ -191,7 +243,8 @@ conv_handler = ConversationHandler(
     },
     fallbacks=[
         CommandHandler("cancel", cancel), CallbackQueryHandler(cancel, pattern='^cancel$'),
-        MessageHandler(filters.TEXT & ~filters.COMMAND, lambda update, context: update.message.reply_text("Unexpected input. Use /cancel or provide info.")),
-        MessageHandler(filters.COMMAND, lambda update, context: update.message.reply_text("Please finish current process or /cancel before new command.")),
+        MessageHandler(filters.TEXT & ~filters.COMMAND, lambda update, context: update.message.reply_text("Unexpected input. /cancel?")),
+        MessageHandler(filters.COMMAND, lambda update, context: update.message.reply_text("Finish current process or /cancel first.")),
     ],
+    # Use defaults for per_*: per_user=True, per_chat=True, per_message=False
 )
