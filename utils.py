@@ -1,29 +1,39 @@
 # utils.py
-# MODIFIED: Accesses config (like DOWNLOAD_DIR) via context.bot_data
+# Contains general utility functions for the bot, including file operations and splitting.
+# MODIFIED: Reduced FFMPEG_SEGMENT_DURATION for smaller video parts.
 
 import os
 import re
 import urllib.parse
 import logging
 import math
-import asyncio
-import subprocess
-import glob
+import asyncio # For sleep and subprocess
+import subprocess # For running ffmpeg (alternative way)
+import glob # To find created parts
 
-# NO 'import config' needed here anymore
-
-# Need ContextTypes for type hinting if modifying function signatures
-from telegram.ext import ContextTypes # Add this import
+# Import config to access DOWNLOAD_DIR and UPLOAD_MODE (or get from context)
+# Assuming config access via context now based on previous steps
+# If still importing config directly, keep 'import config'
+# For context-based access:
+from telegram.ext import ContextTypes # Add if not already present
 
 logger = logging.getLogger(__name__)
 
 # --- Constants ---
-SPLIT_SIZE = 1950 * 1024 * 1024
+SPLIT_SIZE = 1950 * 1024 * 1024 # Approx 1.95 GiB limit check before attempting split
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".mpeg", ".mpg"}
-FFMPEG_SEGMENT_DURATION = 1800
 
-# --- Helper to run FFmpeg ---
-async def _run_ffmpeg_command(cmd_list, chat_id, context: ContextTypes.DEFAULT_TYPE | None): # Added Context type hint
+# --- ADJUSTED DURATION ---
+# Choose a segment duration for ffmpeg splitting (in seconds).
+# Reduced from 1800 (30min) to 900 (15min) to decrease average part size.
+# NOTE: This does NOT guarantee parts will be under 2GB for very high bitrate video.
+# You might need to reduce further (e.g., 600 for 10min) if problems persist.
+FFMPEG_SEGMENT_DURATION = 900
+# --- END ADJUSTED DURATION ---
+
+
+# --- Helper to run FFmpeg command (Unchanged) ---
+async def _run_ffmpeg_command(cmd_list, chat_id, context: ContextTypes.DEFAULT_TYPE | None):
     # ... (function body unchanged) ...
     cmd_str = " ".join(cmd_list); logger.info(f"Running ffmpeg: {cmd_str}")
     process = await asyncio.create_subprocess_exec(*cmd_list, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -39,26 +49,27 @@ async def _run_ffmpeg_command(cmd_list, chat_id, context: ContextTypes.DEFAULT_T
         if err_out: logger.info(f"ffmpeg stderr:\n{err_out}")
         logger.info("ffmpeg success."); return True, out
 
-# --- Video Splitting using FFmpeg ---
-# Modify to accept context to get DOWNLOAD_DIR and pass down to _run_ffmpeg
+
+# --- Video Splitting using FFmpeg (Unchanged - uses the constant) ---
 async def _split_video_ffmpeg(original_path, context: ContextTypes.DEFAULT_TYPE | None, chat_id: int | None):
     base_filename = os.path.basename(original_path)
     _ , file_ext = os.path.splitext(base_filename)
     # Get download_dir from context
-    download_dir = context.bot_data.get('download_dir', '/content/fallback_dl_dir') # Use fallback
+    download_dir = context.bot_data.get('download_dir', '/content/downloads') # Use fallback
 
     parts_dir = os.path.join(download_dir, base_filename + "_parts")
     os.makedirs(parts_dir, exist_ok=True)
     output_pattern = os.path.join(parts_dir, f"{base_filename}_part%03d{file_ext}")
+
+    # This command now uses the adjusted FFMPEG_SEGMENT_DURATION constant
     cmd = ['ffmpeg','-hide_banner','-loglevel','warning','-i',original_path,'-c','copy','-map','0','-segment_time',str(FFMPEG_SEGMENT_DURATION),'-f','segment','-reset_timestamps','1',output_pattern]
 
     logger.info(f"Starting ffmpeg video split for: {base_filename}")
     if context and chat_id:
-        try: await context.bot.send_message(chat_id, f"✂️ Splitting video '{base_filename}' using ffmpeg...")
+        try: await context.bot.send_message(chat_id, f"✂️ Splitting video '{base_filename}' using ffmpeg (segments ~{FFMPEG_SEGMENT_DURATION}s)...")
         except Exception: pass
 
-    # Pass context down to ffmpeg runner
-    success, _ = await _run_ffmpeg_command(cmd, chat_id, context)
+    success, _ = await _run_ffmpeg_command(cmd, chat_id, context) # Pass context
 
     if not success:
         logger.error(f"ffmpeg splitting failed: {original_path}. Cleanup partial dir.");
@@ -75,8 +86,7 @@ async def _split_video_ffmpeg(original_path, context: ContextTypes.DEFAULT_TYPE 
         except Exception: pass
     return created_parts
 
-# --- Main Splitting Logic ---
-# Modify to accept context to pass down and get UPLOAD_MODE
+# --- Main Splitting Logic (Unchanged - calls the ffmpeg func) ---
 async def split_if_needed(original_path, context: ContextTypes.DEFAULT_TYPE | None, chat_id: int | None):
     try:
         if not os.path.exists(original_path): logger.error(f"Split check fail: Not found {original_path}"); return None
@@ -90,8 +100,7 @@ async def split_if_needed(original_path, context: ContextTypes.DEFAULT_TYPE | No
 
         if is_video and upload_mode == "Video":
             logger.info("Attempting video split with ffmpeg...")
-            # Pass context down
-            return await _split_video_ffmpeg(original_path, context, chat_id)
+            return await _split_video_ffmpeg(original_path, context, chat_id) # Calls the ffmpeg func
         else:
             d_dir = context.bot_data.get('download_dir', '/content') if context else '/content'
             logger.warning(f"Large file '{base_filename}' ({file_size/1024/1024:.1f}MB) in {d_dir} cannot be split (not video or mode mismatch).")
@@ -125,6 +134,7 @@ async def cleanup_split_parts(original_path, parts):
              except Exception as e_orig: logger.error(f"Failed delete original {original_path}: {e_orig}")
     except Exception as e: logger.error(f"Error cleanup {original_path}: {e}", exc_info=True)
 
+
 # --- Other existing utils (write_failed, clean_filename, extract_filename - Unchanged) ---
 def write_failed_downloads_to_file(failed_items, downloader_name, download_directory):
     # ... (function body unchanged) ...
@@ -132,8 +142,7 @@ def write_failed_downloads_to_file(failed_items, downloader_name, download_direc
     file_path = os.path.join(download_directory, f"failed_downloads_{downloader_name}.txt")
     try:
         os.makedirs(download_directory, exist_ok=True)
-        with open(file_path, "w") as f:
-            f.write(f"# Failed URLs for {downloader_name}\n"); [f.write(f"{item}\n") for item in failed_items]
+        with open(file_path, "w") as f: f.write(f"# Failed URLs for {downloader_name}\n"); [f.write(f"{item}\n") for item in failed_items]
         logger.info(f"Failed list saved: {file_path}"); return file_path
     except Exception as e: logger.error(f"Error writing failed file: {e}"); return None
 
