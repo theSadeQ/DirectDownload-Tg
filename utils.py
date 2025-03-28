@@ -1,9 +1,8 @@
 # utils.py
-# Contains general utility functions for the bot, including file operations and splitting.
-# MODIFIED: Increased ffmpeg loglevel to 'info' for debugging split issues.
+# Contains general utility functions for the bot, including file operations, splitting, and styling.
 
 import os
-import re
+import re # Make sure re is imported
 import urllib.parse
 import logging
 import math
@@ -23,6 +22,8 @@ TARGET_SPLIT_SIZE_MB = 1800 # Target for calculation (used by dynamic duration)
 TARGET_SPLIT_SIZE_BYTES = TARGET_SPLIT_SIZE_MB * 1024 * 1024
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".mpeg", ".mpg"}
+FFMPEG_SEGMENT_DURATION = 900 # Default 15 mins for fixed-time split attempt (Adjust if needed)
+
 
 # --- Helper to run FFmpeg/FFprobe commands ---
 async def _run_command(cmd_list, command_name="command"):
@@ -44,9 +45,7 @@ async def _run_command(cmd_list, command_name="command"):
         logger.error(f"{command_name} failed (code {return_code}):\n{cmd_str}\nError:\n{error_output}")
         return False, error_output
     else:
-        # Log stderr too even on success
-        if error_output:
-             logger.info(f"{command_name} stderr output:\n{error_output}") # Log potential warnings/info
+        if error_output: logger.info(f"{command_name} stderr output:\n{error_output}") # Log potential warnings/info
         logger.info(f"{command_name} command finished successfully.")
         return True, output
 
@@ -75,34 +74,23 @@ async def _split_video_dynamic_duration(original_path, context: ContextTypes.DEF
 
     if bitrate is None or bitrate <= 0:
         logger.warning(f"Cannot perform size-based split for {base_filename} (bitrate={bitrate}). Aborting split.")
-        if context and chat_id: await context.bot.send_message(chat_id, f"⚠️ Cannot determine video bitrate for '{base_filename}'. Split aborted.")
+        if context and chat_id: await context.bot.send_message(chat_id, f"⚠️ Cannot determine video bitrate for '{base_filename}'. Cannot split by size.")
         return None
 
     # 2. Calculate Segment Duration
     target_size_bits = TARGET_SPLIT_SIZE_BYTES * 8
     calculated_duration = int(target_size_bits / bitrate)
-    segment_duration = max(10, calculated_duration) # Min 10 sec duration
+    segment_duration = max(10, calculated_duration)
     logger.info(f"Calculated target segment duration: {segment_duration} seconds (aiming for ~{TARGET_SPLIT_SIZE_MB}MB)")
 
     if duration_from_probe and segment_duration >= duration_from_probe:
         logger.info("Calculated duration >= total duration. No split needed."); return [original_path]
 
-    # 3. Prepare FFmpeg command
+    # 3. Prepare FFmpeg split command
     parts_dir = os.path.join(download_dir, base_filename + "_parts")
     os.makedirs(parts_dir, exist_ok=True)
     output_pattern = os.path.join(parts_dir, f"{base_filename}_part%03d{file_ext}")
-
-    # ***** CHANGE HERE: Increased log level *****
-    cmd = [
-        'ffmpeg', '-hide_banner',
-        '-loglevel', 'info', # Use 'info' or 'debug' for more details
-        '-i', original_path,
-        '-c', 'copy', '-map', '0',
-        '-segment_time', str(segment_duration),
-        '-f', 'segment', '-reset_timestamps', '1',
-        output_pattern
-    ]
-    # ***** END CHANGE *****
+    cmd = ['ffmpeg','-hide_banner','-loglevel','info','-i',original_path,'-c','copy','-map','0','-segment_time',str(segment_duration),'-f','segment','-reset_timestamps','1',output_pattern]
 
     logger.info(f"Starting ffmpeg video split for: {base_filename}")
     if context and chat_id:
@@ -110,7 +98,7 @@ async def _split_video_dynamic_duration(original_path, context: ContextTypes.DEF
         except Exception: pass
 
     # 4. Run FFmpeg
-    split_success, _ = await _run_command(cmd, "ffmpeg") # Pass context if _run_command needs it
+    split_success, _ = await _run_command(cmd, "ffmpeg") # Pass context if needed by helper
 
     if not split_success:
         logger.error(f"ffmpeg splitting failed: {original_path}. Cleanup partial dir.");
@@ -122,27 +110,20 @@ async def _split_video_dynamic_duration(original_path, context: ContextTypes.DEF
     # 5. Find and return created parts
     part_pattern_glob = os.path.join(parts_dir, f"{base_filename}_part*{file_ext}")
     created_parts = sorted(glob.glob(part_pattern_glob))
-    if not created_parts:
-        logger.error(f"No parts found: {part_pattern_glob}")
-        if context and chat_id: await context.bot.send_message(chat_id, f"❌ Split OK but no parts found for '{base_filename}'.")
-        return None
-
+    if not created_parts: logger.error(f"No parts found: {part_pattern_glob}"); return None
     num_parts_found = len(created_parts)
     logger.info(f"ffmpeg split OK. Found {num_parts_found} parts.")
-    # Handle case where only one part is created (similar size to original)
+    # Handle case where only one part is created
     if num_parts_found == 1 and os.path.exists(original_path):
         try:
              orig_size = os.path.getsize(original_path); part_size = os.path.getsize(created_parts[0])
-             if abs(orig_size - part_size) < 1024*1024: # ~1MB tolerance
-                  logger.info("Only one part, similar size. Using original.");
-                  os.remove(created_parts[0]); os.rmdir(parts_dir)
-                  return [original_path]
-        except Exception as single_part_err: logger.warning(f"Error checking/cleaning single part: {single_part_err}")
-
+             if abs(orig_size - part_size) < 1024*1024: logger.info("Only one part, similar size. Using original."); os.remove(created_parts[0]); os.rmdir(parts_dir); return [original_path]
+        except Exception as sp_err: logger.warning(f"Error check/clean single part: {sp_err}")
     if context and chat_id:
         try: await context.bot.send_message(chat_id, f"✅ Video splitting complete ({num_parts_found} parts).")
         except Exception: pass
     return created_parts
+
 
 # --- Main Splitting Logic ---
 async def split_if_needed(original_path, context: ContextTypes.DEFAULT_TYPE | None, chat_id: int | None):
@@ -163,9 +144,9 @@ async def split_if_needed(original_path, context: ContextTypes.DEFAULT_TYPE | No
             d_dir = context.bot_data.get('download_dir', '/content') if context else '/content'
             logger.warning(f"Large file '{base_filename}' ({file_size/1024/1024:.1f}MB) in {d_dir} cannot split (not video or mode '{upload_mode}').")
             if context and chat_id:
-                 try: await context.bot.send_message(chat_id, f"⚠️ File '{base_filename}' too large & cannot be split for mode '{upload_mode}'.")
+                 try: await context.bot.send_message(chat_id, f"⚠️ File '{base_filename}' too large & cannot split for mode '{upload_mode}'.")
                  except Exception: pass
-            return None # Splitting not supported/failed
+            return None
     except Exception as e:
         logger.error(f"Error splitting check {original_path}: {e}", exc_info=True)
         if context and chat_id:
@@ -189,14 +170,13 @@ async def cleanup_split_parts(original_path, parts):
         if os.path.isdir(parts_dir):
              try: os.rmdir(parts_dir); logger.info(f"Removed parts dir: {parts_dir}")
              except OSError as e_dir: logger.warning(f"Could not remove parts dir {parts_dir}: {e_dir}")
-        # Only delete original if splitting definitely occurred (more than 1 part generated/returned)
         if os.path.exists(original_path) and len(parts) > 1:
              try: os.remove(original_path); logger.info(f"Deleted original: {original_path}")
              except Exception as e_orig: logger.error(f"Failed delete original {original_path}: {e_orig}")
     except Exception as e: logger.error(f"Error cleanup {original_path}: {e}", exc_info=True)
 
 
-# --- Other existing utils (Unchanged) ---
+# --- Existing File/String Utilities ---
 def write_failed_downloads_to_file(failed_items, downloader_name, download_directory):
     # ... (function body unchanged) ...
     if not failed_items: return None
@@ -208,7 +188,8 @@ def clean_filename(filename):
     # ... (function body unchanged) ...
     try: filename = urllib.parse.unquote(filename, encoding='utf-8', errors='replace')
     except Exception: pass
-    filename = filename.replace('%20', ' '); cleaned_filename = re.sub(r'[\\/:*?"<>|]', '_', filename); cleaned_filename = re.sub(r'_+', '_', cleaned_filename); cleaned_filename = cleaned_filename.strip('._ '); cleaned_filename = cleaned_filename[:250]; return cleaned_filename if cleaned_filename else "downloaded_file"
+    filename = filename.replace('%20', ' '); cleaned_filename = re.sub(r'[\\/:*?"<>|\[\]]', '_', filename) # Added brackets here too
+    cleaned_filename = re.sub(r'_+', '_', cleaned_filename); cleaned_filename = cleaned_filename.strip('._ '); cleaned_filename = cleaned_filename[:250]; return cleaned_filename if cleaned_filename else "downloaded_file"
 
 def extract_filename_from_url(url):
     # ... (function body unchanged) ...
@@ -219,3 +200,18 @@ def extract_filename_from_url(url):
         if not filename_raw: filename_raw = parsed_url.netloc.replace('.', '_') + "_file"
         decoded_filename = urllib.parse.unquote(filename_raw, encoding='utf-8', errors='replace'); return clean_filename(decoded_filename)
     except Exception as e: logger.warning(f"Error extracting FN from {url}: {e}"); return None
+
+# --- NEW: Filename Styling Function ---
+def apply_dot_style(filename):
+    """Applies a specific style replacing common separators with dots."""
+    # Replace sequences of space, underscore, or hyphen with a single dot
+    # Includes underscores that might result from clean_filename's replacements
+    styled_name = re.sub(r'[ _-]+', '.', filename)
+    # Remove any remaining brackets just in case (clean_filename should handle)
+    styled_name = styled_name.replace('[', '').replace(']', '')
+    # Collapse multiple dots into one
+    styled_name = re.sub(r'\.+', '.', styled_name)
+    # Remove leading/trailing dots
+    styled_name = styled_name.strip('.')
+    # Ensure filename is not empty after styling
+    return styled_name if styled_name else "styled_file"
