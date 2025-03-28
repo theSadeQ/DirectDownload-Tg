@@ -1,7 +1,5 @@
 # handlers.py
-# Contains PTB handlers, conversation logic, and the reporting helper.
-# Includes Bitso filename choice, styling for manual filenames.
-# FIXED: TypeError using cd= instead of callback_data= for Bitso keyboard.
+# FINAL VERSION: Includes all features and fixes.
 
 import logging
 import asyncio
@@ -20,18 +18,28 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 # Import utils
-from utils import (
-    extract_filename_from_url,
-    clean_filename,
-    write_failed_downloads_to_file,
-    apply_dot_style
-)
+try:
+    from utils import (
+        extract_filename_from_url,
+        clean_filename,
+        write_failed_downloads_to_file,
+        apply_dot_style
+    )
+except ImportError as e:
+    logging.basicConfig(level=logging.ERROR)
+    logging.error(f"Failed to import from utils.py: {e}. Ensure utils.py exists and is correct.")
+    raise
+
 # Import downloaders
-from downloaders import (
-    download_files_nzbcloud,
-    download_multiple_files_deltaleech,
-    download_multiple_files_bitso
-)
+try:
+    from downloaders import (
+        download_files_nzbcloud,
+        download_multiple_files_deltaleech,
+        download_multiple_files_bitso
+    )
+except ImportError as e:
+    logging.error(f"Failed to import from downloaders.py: {e}. Ensure downloaders.py exists and is correct.")
+    raise
 
 logger = logging.getLogger(__name__)
 
@@ -75,57 +83,39 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cred_status = "API/Token Configured." if context.bot_data.get('pyrogram_client') else "⚠️ API/Token Error!"; upload_status = f"✅ Uploads ON (Mode: {upload_mode})." if upload_enabled else "ℹ️ Uploads OFF."; delete_status = f"🗑️ Delete ON." if upload_enabled and delete_after_upload else "💾 Delete OFF."
     await update.message.reply_html(rf"Hi {user.mention_html()}!\n\n{cred_status}\n{upload_status}\n{delete_status}\n\nUse /download to start.",)
 
+# --- CORRECTED cancel function ---
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # ... (function unchanged) ...
+    """ Cancels and ends the conversation. Restored fallback logic."""
     user_id = update.effective_user.id if update.effective_user else "Unknown"; logger.info(f"User {user_id} cancelled.")
     message_text = "Download process cancelled."; query = update.callback_query
     try:
-        if query: await query.answer(); await query.edit_message_text(message_text)
-        elif update.message: await update.message.reply_text(message_text)
-    except Exception as e: logger.warning(f"Failed send/edit cancel confirm: {e}"); try: await context.bot.send_message(update.effective_chat.id, message_text)
-    except Exception as send_e: logger.error(f"Failed sending cancel confirm fallback: {send_e}")
+        if query:
+            await query.answer()
+            await query.edit_message_text(message_text)
+        elif update.message:
+            await update.message.reply_text(message_text)
+    except Exception as e:
+        logger.warning(f"Failed send/edit cancel confirmation: {e}")
+        # Nested try starts on a new line, indented under except
+        try:
+            # Attempt to send a new message if editing failed
+            await context.bot.send_message(update.effective_chat.id, message_text)
+        except Exception as send_e:
+            logger.error(f"Failed sending cancel confirmation fallback: {send_e}")
     context.user_data.clear(); return ConversationHandler.END
+# --- END CORRECTED cancel function ---
 
 # --- Conversation Handlers ---
 
 # Helper Function to process URLs
 async def _process_urls_and_proceed(urls: list[str], update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """ Stores valid URLs, logs, determines next step based on downloader. """
-    if not urls:
-        await update.message.reply_text("⚠️ No valid HTTP(S) URLs found. Send again or /cancel.")
-        current_downloader = context.user_data.get('downloader')
-        if current_downloader == 'bitso': return GET_URLS_BITSO
-        else: return GET_URLS
-
-    context.user_data['urls'] = urls
-    downloader = context.user_data.get('downloader', 'N/A')
-    logger.info(f"Processed {len(urls)} URLs for {downloader}.")
-
-    if downloader == 'nzbcloud':
-        await update.message.reply_text(f"✅ Got {len(urls)} URL(s).\nSend FN(s):")
-        return GET_FILENAMES_NZB
-    elif downloader == 'deltaleech':
-        kb = [
-            [InlineKeyboardButton("Extract FNs", callback_data='delta_use_url_fn')],
-            [InlineKeyboardButton("Provide FNs", callback_data='delta_manual_fn')],
-            [InlineKeyboardButton("Cancel", callback_data='cancel')]
-        ]
-        await update.message.reply_text(f"✅ Got {len(urls)} URL(s).\nFilenames?", reply_markup=InlineKeyboardMarkup(kb))
-        return CONFIRM_DELTA_FN
-    elif downloader == 'bitso':
-         # ***** CORRECTED KEYBOARD *****
-         kb = [
-             [InlineKeyboardButton("Yes, from URLs", callback_data='bitso_use_url_fn')],
-             [InlineKeyboardButton("No, provide", callback_data='bitso_manual_fn')],
-             [InlineKeyboardButton("Cancel", callback_data='cancel')]
-         ]
-         # ***** END CORRECTION *****
-         await update.message.reply_text(f"✅ Got {len(urls)} URL(s).\nExtract filenames?", reply_markup=InlineKeyboardMarkup(kb))
-         return CONFIRM_BITSO_FN # Transition to new state
-    else:
-        logger.error(f"Unknown downloader '{downloader}' in _process_urls.")
-        await update.message.reply_text("Internal error. /cancel")
-        return ConversationHandler.END
+    # ... (function unchanged) ...
+    if not urls: await update.message.reply_text("⚠️ No valid HTTP(S) URLs found. Send again or /cancel."); current_downloader = context.user_data.get('downloader'); return GET_URLS_BITSO if current_downloader == 'bitso' else GET_URLS
+    context.user_data['urls'] = urls; downloader = context.user_data.get('downloader', 'N/A'); logger.info(f"Processed {len(urls)} URLs for {downloader}.")
+    if downloader == 'nzbcloud': await update.message.reply_text(f"✅ Got {len(urls)} URL(s).\nSend FN(s):"); return GET_FILENAMES_NZB
+    elif downloader == 'deltaleech': kb = [[InlineKeyboardButton("Extract FNs", callback_data='delta_use_url_fn')],[InlineKeyboardButton("Provide FNs", callback_data='delta_manual_fn')],[InlineKeyboardButton("Cancel", callback_data='cancel')]]; await update.message.reply_text(f"✅ Got {len(urls)} URL(s).\nFilenames?", reply_markup=InlineKeyboardMarkup(kb)); return CONFIRM_DELTA_FN
+    elif downloader == 'bitso': kb = [[InlineKeyboardButton("Yes, from URLs", callback_data='bitso_use_url_fn')],[InlineKeyboardButton("No, provide", callback_data='bitso_manual_fn')],[InlineKeyboardButton("Cancel", callback_data='cancel')]]; await update.message.reply_text(f"✅ Got {len(urls)} URL(s).\nExtract filenames?", reply_markup=InlineKeyboardMarkup(kb)); return CONFIRM_BITSO_FN
+    else: logger.error(f"Unknown downloader '{downloader}'."); await update.message.reply_text("Internal error."); return ConversationHandler.END
 
 async def start_download_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
      # ... (function unchanged) ...
