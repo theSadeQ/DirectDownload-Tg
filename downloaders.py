@@ -1,11 +1,13 @@
 # downloaders.py
-# MODIFIED: Accesses config (DOWNLOAD_DIR, DELETE_AFTER_UPLOAD) via context.bot_data
+# Contains download logic for different services, including file splitting check.
+# MODIFIED: Accesses config via context.bot_data. Fixed SyntaxError in download_file_bitso.
 
 import logging
 import asyncio
 import requests
 import os
 
+# Import framework types
 from pyrogram import Client
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -26,8 +28,7 @@ async def download_files_nzbcloud(urls, filenames, cf_clearance, update: Update,
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://app.nzbcloud.com/"}
     failed_sources = []
     chat_id = update.effective_chat.id
-    # Get config from context
-    download_dir = context.bot_data.get('download_dir', '/content/downloads') # Provide fallback
+    download_dir = context.bot_data.get('download_dir', '/content/downloads')
     delete_after_upload = context.bot_data.get('delete_after_upload', True)
 
     for idx, (url, file_name) in enumerate(zip(urls, filenames)):
@@ -35,7 +36,7 @@ async def download_files_nzbcloud(urls, filenames, cf_clearance, update: Update,
         if not url or not file_name: logger.warning(f"Skip nzb: URL/FN missing {idx+1}."); failed_sources.append(url or f"No URL for {file_name}"); continue
 
         file_name = clean_filename(file_name)
-        full_file_path = os.path.join(download_dir, file_name) # Use download_dir from context
+        full_file_path = os.path.join(download_dir, file_name)
         download_success = False
         try: os.makedirs(os.path.dirname(full_file_path), exist_ok=True)
         except OSError as e: logger.error(f"Dir error {full_file_path}: {e}"); failed_sources.append(url); continue
@@ -53,7 +54,6 @@ async def download_files_nzbcloud(urls, filenames, cf_clearance, update: Update,
             if response: response.close()
 
         if download_success:
-            # Pass context to splitter
             parts = await split_if_needed(full_file_path, context, chat_id)
             if parts:
                 all_ok = True; total = len(parts)
@@ -61,6 +61,7 @@ async def download_files_nzbcloud(urls, filenames, cf_clearance, update: Update,
                     part_cap = f"{file_name} (Part {i+1}/{total})" if total > 1 else file_name
                     upload_ok = await upload_file_pyrogram(pyrogram_client, update, context, part_path, part_cap)
                     if not upload_ok: all_ok = False; break
+                # Use delete_after_upload fetched from context earlier
                 if delete_after_upload and parts and all_ok: await cleanup_split_parts(full_file_path, parts)
                 if not all_ok and url not in failed_sources: failed_sources.append(url)
             else: # Splitting failed
@@ -97,6 +98,7 @@ async def download_file_deltaleech(url, file_name, cf_clearance, update: Update,
                 part_cap = f"{file_name} (Part {i+1}/{total})" if total > 1 else file_name
                 upload_ok = await upload_file_pyrogram(pyrogram_client, update, context, part_path, part_cap)
                 if not upload_ok: all_ok = False; break
+            # Use delete_after_upload fetched from context earlier
             if delete_after_upload and parts and all_ok: await cleanup_split_parts(full_file_path, parts)
             return all_ok
         else: return False # Splitting failed
@@ -117,7 +119,14 @@ async def download_multiple_files_deltaleech(urls, file_names, cf_clearance, upd
 async def download_file_bitso(url, file_name, referer_url, id_cookie, sess_cookie, update: Update, context: ContextTypes.DEFAULT_TYPE, pyrogram_client: Client):
     """ Downloads single Bitso file, splits, uploads. Accesses config via context. Returns bool success."""
     cookies = {}; headers = {"Referer": referer_url, "User-Agent": "Mozilla/5.0"}
-    if id_cookie: cookies["_identity"] = id_cookie; if sess_cookie: cookies["PHPSESSID"] = sess_cookie
+
+    # ***** CORRECTED LINES *****
+    if id_cookie:
+        cookies["_identity"] = id_cookie
+    if sess_cookie:
+        cookies["PHPSESSID"] = sess_cookie
+    # ***** END CORRECTION *****
+
     chat_id = update.effective_chat.id; file_name = clean_filename(file_name)
     download_dir = context.bot_data.get('download_dir', '/content/downloads'); delete_after_upload = context.bot_data.get('delete_after_upload', True)
     full_file_path = os.path.join(download_dir, file_name); download_success = False
@@ -143,6 +152,7 @@ async def download_file_bitso(url, file_name, referer_url, id_cookie, sess_cooki
                 part_cap = f"{file_name} (Part {i+1}/{total})" if total > 1 else file_name
                 upload_ok = await upload_file_pyrogram(pyrogram_client, update, context, part_path, part_cap)
                 if not upload_ok: all_ok = False; break
+            # Use delete_after_upload fetched from context earlier
             if delete_after_upload and parts and all_ok: await cleanup_split_parts(full_file_path, parts)
             return all_ok
         else: return False # Splitting failed
