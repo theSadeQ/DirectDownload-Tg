@@ -96,7 +96,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 # --- Conversation Handlers ---
 async def start_download_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
      if 'pyrogram_client' not in context.bot_data: await update.message.reply_text("⚠️ Bot init error."); return ConversationHandler.END
-     kb = [[InlineKeyboardButton(s, callback_data=s.lower().split()[1])) for s in ["☁️ nzbCloud", "💧 DeltaLeech", "🪙 Bitso"]] + [[InlineKeyboardButton("❌ Cancel", callback_data='cancel')]]
+     kb = [[InlineKeyboardButton(s, callback_data=s.lower().split()[1]) for s in ["☁️ nzbCloud", "💧 DeltaLeech", "🪙 Bitso"]] + [[InlineKeyboardButton("❌ Cancel", callback_data='cancel')]]
      await update.message.reply_text("Choose service:", reply_markup=InlineKeyboardMarkup(kb)); return CHOOSE_DOWNLOADER
 
 async def choose_downloader(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
