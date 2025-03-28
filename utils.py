@@ -1,6 +1,6 @@
 # utils.py
 # Contains general utility functions for the bot, including file operations and splitting.
-# MODIFIED: Reduced FFMPEG_SEGMENT_DURATION for smaller video parts.
+# MODIFIED: Implements ffmpeg video splitting based on calculated duration aiming for ~1800MB parts.
 
 import os
 import re
@@ -8,115 +8,207 @@ import urllib.parse
 import logging
 import math
 import asyncio # For sleep and subprocess
-import subprocess # For running ffmpeg (alternative way)
+import subprocess # For running ffmpeg/ffprobe
 import glob # To find created parts
+import json # To parse ffprobe output
 
-# Import config to access DOWNLOAD_DIR and UPLOAD_MODE (or get from context)
-# Assuming config access via context now based on previous steps
-# If still importing config directly, keep 'import config'
-# For context-based access:
-from telegram.ext import ContextTypes # Add if not already present
+# Need ContextTypes for type hinting if modifying function signatures
+from telegram.ext import ContextTypes # Add this import
 
 logger = logging.getLogger(__name__)
 
 # --- Constants ---
-SPLIT_SIZE = 1950 * 1024 * 1024 # Approx 1.95 GiB limit check before attempting split
+# Target size for parts (1800 MiB)
+TARGET_SPLIT_SIZE_MB = 1800
+TARGET_SPLIT_SIZE_BYTES = TARGET_SPLIT_SIZE_MB * 1024 * 1024
+# Original check size limit (slightly larger, just to trigger splitting process)
+SPLIT_CHECK_SIZE = 1950 * 1024 * 1024 # Approx 1.95 GiB
+
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".mpeg", ".mpg"}
 
-# --- ADJUSTED DURATION ---
-# Choose a segment duration for ffmpeg splitting (in seconds).
-# Reduced from 1800 (30min) to 900 (15min) to decrease average part size.
-# NOTE: This does NOT guarantee parts will be under 2GB for very high bitrate video.
-# You might need to reduce further (e.g., 600 for 10min) if problems persist.
-FFMPEG_SEGMENT_DURATION = 900
-# --- END ADJUSTED DURATION ---
 
+# --- Helper to run FFmpeg/FFprobe commands ---
+async def _run_command(cmd_list, command_name="command"):
+    """Runs an external command asynchronously, logs output, returns success(bool), output(str)."""
+    cmd_str = " ".join(map(str, cmd_list)) # Ensure all parts are strings for join
+    logger.info(f"Running {command_name}: {cmd_str}")
+    process = await asyncio.create_subprocess_exec(
+        *cmd_list,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await process.communicate()
+    return_code = process.returncode
 
-# --- Helper to run FFmpeg command (Unchanged) ---
-async def _run_ffmpeg_command(cmd_list, chat_id, context: ContextTypes.DEFAULT_TYPE | None):
-    # ... (function body unchanged) ...
-    cmd_str = " ".join(cmd_list); logger.info(f"Running ffmpeg: {cmd_str}")
-    process = await asyncio.create_subprocess_exec(*cmd_list, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    stdout, stderr = await process.communicate(); return_code = process.returncode
+    output = stdout.decode('utf-8', errors='replace').strip()
+    error_output = stderr.decode('utf-8', errors='replace').strip()
+
     if return_code != 0:
-        err_out = stderr.decode('utf-8', 'replace').strip(); logger.error(f"ffmpeg failed ({return_code}):\n{cmd_str}\n{err_out}")
-        if context and chat_id:
-             try: await context.bot.send_message(chat_id, f"❌ ffmpeg failed (code {return_code}). Check logs.")
-             except Exception: pass
-        return False, None
+        logger.error(f"{command_name} failed (code {return_code}):\n{cmd_str}\nError:\n{error_output}")
+        return False, error_output # Return error output for potential debugging
     else:
-        out = stdout.decode('utf-8', 'replace').strip(); err_out = stderr.decode('utf-8', 'replace').strip()
-        if err_out: logger.info(f"ffmpeg stderr:\n{err_out}")
-        logger.info("ffmpeg success."); return True, out
+        # Log stderr too even on success, as useful info might be there
+        if error_output:
+             logger.info(f"{command_name} stderr output:\n{error_output}")
+        logger.info(f"{command_name} command finished successfully.")
+        return True, output # Return stdout output on success
 
 
-# --- Video Splitting using FFmpeg (Unchanged - uses the constant) ---
-async def _split_video_ffmpeg(original_path, context: ContextTypes.DEFAULT_TYPE | None, chat_id: int | None):
+# --- Video Splitting using FFmpeg (Dynamic Duration) ---
+async def _split_video_dynamic_duration(original_path, context: ContextTypes.DEFAULT_TYPE | None, chat_id: int | None):
+    """Splits a video file into segments using calculated duration based on bitrate."""
     base_filename = os.path.basename(original_path)
+    file_dir = os.path.dirname(original_path)
     _ , file_ext = os.path.splitext(base_filename)
-    # Get download_dir from context
-    download_dir = context.bot_data.get('download_dir', '/content/downloads') # Use fallback
 
+    # Get config values from context
+    download_dir = context.bot_data.get('download_dir', '/content/downloads') if context else '/content/downloads'
+
+    # 1. Get Bitrate using ffprobe
+    logger.info(f"Getting bitrate for {base_filename} using ffprobe...")
+    ffprobe_cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_format", "-show_streams", original_path # Added show_streams for more info if needed
+    ]
+    probe_success, probe_output = await _run_command(ffprobe_cmd, "ffprobe")
+
+    bitrate = None
+    duration_from_probe = None
+    if probe_success and probe_output:
+        try:
+            video_info = json.loads(probe_output)
+            if 'format' in video_info and 'bit_rate' in video_info['format']:
+                bitrate = float(video_info["format"]["bit_rate"])
+                logger.info(f"Detected bitrate: {bitrate} bps")
+            if 'format' in video_info and 'duration' in video_info['format']:
+                 duration_from_probe = float(video_info["format"]["duration"]) # Total duration
+        except json.JSONDecodeError:
+            logger.error("Failed to parse ffprobe JSON output.")
+        except KeyError:
+             logger.warning("Could not find bitrate or duration in ffprobe output.")
+
+    if bitrate is None or bitrate <= 0:
+        logger.warning(f"Could not determine bitrate for {base_filename}, cannot perform size-based split. Aborting split.")
+        if context and chat_id: await context.bot.send_message(chat_id, f"⚠️ Could not determine video bitrate for '{base_filename}'. Cannot split by size.")
+        return None # Cannot proceed without bitrate
+
+    # 2. Calculate Segment Duration
+    target_size_bits = TARGET_SPLIT_SIZE_BYTES * 8
+    # Calculate target duration per segment
+    calculated_duration = int(target_size_bits / bitrate)
+    # Add a minimum duration (e.g., 10 seconds) to avoid tiny segments for huge bitrates
+    segment_duration = max(10, calculated_duration)
+    logger.info(f"Calculated target segment duration: {segment_duration} seconds (aiming for ~{TARGET_SPLIT_SIZE_MB}MB parts)")
+
+    # Optional: Check if calculated duration is longer than total -> no split needed
+    if duration_from_probe and segment_duration >= duration_from_probe:
+        logger.info("Calculated segment duration >= total duration. No splitting needed based on size/bitrate.")
+        return [original_path]
+
+    # 3. Prepare for FFmpeg split command
     parts_dir = os.path.join(download_dir, base_filename + "_parts")
     os.makedirs(parts_dir, exist_ok=True)
     output_pattern = os.path.join(parts_dir, f"{base_filename}_part%03d{file_ext}")
 
-    # This command now uses the adjusted FFMPEG_SEGMENT_DURATION constant
-    cmd = ['ffmpeg','-hide_banner','-loglevel','warning','-i',original_path,'-c','copy','-map','0','-segment_time',str(FFMPEG_SEGMENT_DURATION),'-f','segment','-reset_timestamps','1',output_pattern]
+    cmd = [
+        'ffmpeg', '-hide_banner', '-loglevel', 'warning',
+        '-i', original_path,
+        '-c', 'copy', '-map', '0',
+        '-segment_time', str(segment_duration), # Use calculated duration
+        '-f', 'segment', '-reset_timestamps', '1',
+        output_pattern
+    ]
 
     logger.info(f"Starting ffmpeg video split for: {base_filename}")
     if context and chat_id:
-        try: await context.bot.send_message(chat_id, f"✂️ Splitting video '{base_filename}' using ffmpeg (segments ~{FFMPEG_SEGMENT_DURATION}s)...")
+        try: await context.bot.send_message(chat_id, f"✂️ Splitting video '{base_filename}' (aiming for ~{TARGET_SPLIT_SIZE_MB}MB parts)...")
         except Exception: pass
 
-    success, _ = await _run_ffmpeg_command(cmd, chat_id, context) # Pass context
+    # 4. Run FFmpeg
+    split_success, _ = await _run_command(cmd, "ffmpeg")
 
-    if not success:
-        logger.error(f"ffmpeg splitting failed: {original_path}. Cleanup partial dir.");
+    if not split_success:
+        logger.error(f"ffmpeg splitting failed for {original_path}. Cleaning up partial parts dir.")
         try: import shutil; shutil.rmtree(parts_dir)
         except Exception as cleanup_err: logger.error(f"Failed cleanup {parts_dir}: {cleanup_err}")
-        return None
+        if context and chat_id: await context.bot.send_message(chat_id, f"❌ Error occurred during video splitting for '{base_filename}'.")
+        return None # Indicate failure
 
+    # 5. Find and return created parts
     part_pattern_glob = os.path.join(parts_dir, f"{base_filename}_part*{file_ext}")
     created_parts = sorted(glob.glob(part_pattern_glob))
-    if not created_parts: logger.error(f"No parts found: {part_pattern_glob}"); return None
-    logger.info(f"ffmpeg split OK. Found {len(created_parts)} parts.")
+
+    if not created_parts:
+        logger.error(f"ffmpeg seemed to succeed but no part files found: {part_pattern_glob}")
+        if context and chat_id: await context.bot.send_message(chat_id, f"❌ Splitting seemed finished, but no parts found for '{base_filename}'.")
+        return None
+
+    num_parts_found = len(created_parts)
+    logger.info(f"ffmpeg split successful. Found {num_parts_found} parts.")
+    # Check if only one part was created (might happen if calculation was off or video short)
+    if num_parts_found == 1 and os.path.exists(original_path):
+        original_size = os.path.getsize(original_path)
+        part_size = os.path.getsize(created_parts[0])
+        # If the single part is almost the same size as original, just use original
+        if abs(original_size - part_size) < 1024 * 1024: # Tolerance of 1MB
+             logger.info("Only one part created, similar size to original. Using original file.")
+             try: # Cleanup the single part and dir
+                  os.remove(created_parts[0])
+                  os.rmdir(parts_dir)
+             except Exception as cleanup_err: logger.warning(f"Could not cleanup single part/dir: {cleanup_err}")
+             return [original_path]
+
+    # Send completion message
     if context and chat_id:
-        try: await context.bot.send_message(chat_id, f"✅ Video splitting complete ({len(created_parts)} parts).")
+        try: await context.bot.send_message(chat_id, f"✅ Video splitting complete ({num_parts_found} parts created).")
         except Exception: pass
+
     return created_parts
 
-# --- Main Splitting Logic (Unchanged - calls the ffmpeg func) ---
+
+# --- Main Splitting Logic ---
 async def split_if_needed(original_path, context: ContextTypes.DEFAULT_TYPE | None, chat_id: int | None):
+    """
+    Checks file size and splits it if needed. Uses ffmpeg dynamic duration for videos in Video mode.
+    Returns a list of file paths (original file or parts), or None on error/unsupported.
+    """
     try:
         if not os.path.exists(original_path): logger.error(f"Split check fail: Not found {original_path}"); return None
         file_size = os.path.getsize(original_path); base_filename = os.path.basename(original_path)
         _ , ext = os.path.splitext(base_filename); is_video = ext.lower() in VIDEO_EXTENSIONS
-        # Get upload_mode from context
+        # Get upload_mode from context (essential for deciding split method)
         upload_mode = context.bot_data.get('upload_mode', 'Document') if context else 'Document'
 
         logger.info(f"Checking '{base_filename}': Size={file_size}, IsVideo={is_video}, UploadMode={upload_mode}")
-        if file_size <= SPLIT_SIZE: logger.info("Size OK, no split."); return [original_path]
+        if file_size <= SPLIT_CHECK_SIZE: # Check against slightly larger threshold first
+            logger.info("File size within check limit, no splitting needed.")
+            return [original_path]
 
+        # --- File needs splitting ---
         if is_video and upload_mode == "Video":
-            logger.info("Attempting video split with ffmpeg...")
-            return await _split_video_ffmpeg(original_path, context, chat_id) # Calls the ffmpeg func
+            # Use ffmpeg dynamic duration splitting for videos if upload mode is Video
+            logger.info("Attempting video split with dynamic duration ffmpeg...")
+            return await _split_video_dynamic_duration(original_path, context, chat_id)
         else:
+            # File is large, but not a video OR upload mode is not Video.
             d_dir = context.bot_data.get('download_dir', '/content') if context else '/content'
-            logger.warning(f"Large file '{base_filename}' ({file_size/1024/1024:.1f}MB) in {d_dir} cannot be split (not video or mode mismatch).")
+            logger.warning(f"Large file '{base_filename}' ({file_size/1024/1024:.1f}MB) in {d_dir} cannot be split (not video or mode is '{upload_mode}').")
             if context and chat_id:
-                 try: await context.bot.send_message(chat_id, f"⚠️ File '{base_filename}' too large & cannot be split for mode '{upload_mode}'.")
+                 try: await context.bot.send_message(chat_id, f"⚠️ File '{base_filename}' ({file_size/1024/1024:.1f} MB) is too large & cannot be split for mode '{upload_mode}'. Upload aborted.")
                  except Exception: pass
-            return None
+            return None # Indicate splitting is not supported/failed
+
     except Exception as e:
-        logger.error(f"Error splitting check {original_path}: {e}", exc_info=True)
+        logger.error(f"Error during splitting check {original_path}: {e}", exc_info=True)
         if context and chat_id:
             try: await context.bot.send_message(chat_id, f"❌ Error check/split '{os.path.basename(original_path)}': {e}")
             except Exception: pass
         return None
 
+
 # --- Cleanup Utility (Unchanged) ---
 async def cleanup_split_parts(original_path, parts):
+    """Deletes split parts and their directory, and optionally the original file."""
     # ... (function body unchanged) ...
     if not parts or len(parts) <= 1: logger.debug(f"Cleanup skipped {original_path}."); return
     parts_dir = os.path.dirname(parts[0]); logger.info(f"Cleaning up {len(parts)} parts in {parts_dir}"); deleted_parts_count = 0
@@ -129,13 +221,14 @@ async def cleanup_split_parts(original_path, parts):
         if os.path.isdir(parts_dir):
              try: os.rmdir(parts_dir); logger.info(f"Removed parts dir: {parts_dir}")
              except OSError as e_dir: logger.warning(f"Could not remove parts dir {parts_dir}: {e_dir}")
-        if os.path.exists(original_path):
+        # Only delete original if splitting definitely occurred (more than 1 part generated)
+        if os.path.exists(original_path) and len(parts) > 1:
              try: os.remove(original_path); logger.info(f"Deleted original: {original_path}")
              except Exception as e_orig: logger.error(f"Failed delete original {original_path}: {e_orig}")
     except Exception as e: logger.error(f"Error cleanup {original_path}: {e}", exc_info=True)
 
 
-# --- Other existing utils (write_failed, clean_filename, extract_filename - Unchanged) ---
+# --- Other existing utils (Unchanged) ---
 def write_failed_downloads_to_file(failed_items, downloader_name, download_directory):
     # ... (function body unchanged) ...
     if not failed_items: return None
