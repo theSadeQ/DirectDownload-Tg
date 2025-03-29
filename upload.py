@@ -1,7 +1,6 @@
 # upload.py
-# Handles the file upload using Pyrogram.
+# Handles the file upload using Pyrogram/Pyrofork.
 # Gets config via context. Edits progress via pyro client. Downloads thumb URL.
-# FIXED: SyntaxError in except block before fallback.
 
 import logging
 import os
@@ -10,7 +9,7 @@ import asyncio
 import tempfile
 import requests
 
-# Import Pyrogram types/errors
+# Import Pyrogram types/errors (Pyrofork uses same namespace)
 from pyrogram import Client
 from pyrogram.errors import FloodWait, MediaCaptionTooLong, BadRequest, BotMethodInvalid
 
@@ -23,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 # --- Helper Function to Download Thumbnail ---
 async def _download_thumb(url: str) -> str | None:
-    # ... (function unchanged) ...
+    """Downloads image URL to a temporary file, returns path or None."""
     temp_thumb_path = None
     try:
         response = await asyncio.to_thread(requests.get, url, stream=True, timeout=10); response.raise_for_status()
@@ -67,7 +66,6 @@ async def upload_file_pyrogram(
         except Exception as e: logger.error(f"Failed init status msg: {e}"); status_message_id = None
 
         async def progress(current, total):
-            # ... (progress callback exactly as in previous correct version) ...
             nonlocal last_update_time, status_message_id, pyrogram_client
             if not status_message_id: return
             try:
@@ -90,7 +88,6 @@ async def upload_file_pyrogram(
         kwargs = {'chat_id': upload_destination_chat_id, 'caption': caption, 'progress': progress}
         if thumb_to_use: kwargs['thumb'] = thumb_to_use
         attempted_mode = upload_mode_str
-
         if upload_mode_str == "Video": upload_func = pyrogram_client.send_video; kwargs['video'] = file_path; kwargs['supports_streaming'] = True
         elif upload_mode_str == "Audio": upload_func = pyrogram_client.send_audio; kwargs['audio'] = file_path
         else: attempted_mode = "Document"; upload_func = pyrogram_client.send_document; kwargs['document'] = file_path; kwargs['force_document'] = True
@@ -101,67 +98,44 @@ async def upload_file_pyrogram(
             sent_message = await upload_func(**kwargs)
             logger.info(f"Success upload {attempted_mode} -> {upload_destination_chat_id}.")
             upload_mode_str = attempted_mode
-        # ***** CORRECTED EXCEPTION BLOCK *****
         except (MediaCaptionTooLong, BadRequest, BotMethodInvalid, TimeoutError, ValueError) as e:
             logger.error(f"Pyro err {attempted_mode} -> {upload_destination_chat_id}: {e}. Fallback...")
-            # Edit status message *before* fallback attempt (INDENTED under if)
             if status_message_id:
-                try:
-                    await pyrogram_client.edit_message_text(
-                        chat_id=original_chat_id,
-                        message_id=status_message_id,
-                        text=f"⚠️ {attempted_mode} fail: {str(e)[:100]}. Fallback..."
-                    )
-                except Exception as edit_err:
-                     logger.error(f"Failed edit during fallback notify: {edit_err}")
-            # Attempt fallback
+                try: await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=f"⚠️ {attempted_mode} fail: {str(e)[:100]}. Fallback...")
+                except Exception as edit_err: logger.error(f"Failed edit fallback notify: {edit_err}")
             if attempted_mode != "Document":
                 try:
                     logger.info("Attempt fallback Document..."); kwargs.pop('video', None); kwargs.pop('audio', None); kwargs.pop('supports_streaming', None); kwargs['document'] = file_path; kwargs['force_document'] = True
                     if status_message_id: await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=f"⏫ Upload (Fallback)...")
-                    sent_message = await pyrogram_client.send_document(**kwargs) # Fallback upload
+                    sent_message = await pyrogram_client.send_document(**kwargs)
                     upload_mode_str = "Document (Fallback)"; logger.info("Fallback success.")
-                except Exception as fallback_e:
-                    logger.error(f"Fallback failed: {fallback_e}", exc_info=True); sent_message = None
-                    # Edit status after fallback failure (INDENTED under this inner except)
-                    if status_message_id:
-                        try: await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=f"❌ Fallback fail: {str(fallback_e)[:100]}")
-                        except Exception: pass # Ignore final edit error
-            else: # Original attempt was Document and it failed
-                 logger.error(f"Doc upload failed: {e}", exc_info=True); sent_message = None
-                 # Edit status after document failure (INDENTED under this else)
-                 if status_message_id:
-                      try: await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=f"❌ Document fail: {str(e)[:100]}")
-                      except Exception: pass # Ignore final edit error
-        # ***** END CORRECTED EXCEPTION BLOCK *****
+                except Exception as fallback_e: logger.error(f"Fallback failed: {fallback_e}", exc_info=True); sent_message = None
+            else: logger.error(f"Doc upload failed: {e}", exc_info=True); sent_message = None
+            if not sent_message and status_message_id:
+                 final_fallback_error = fallback_e if 'fallback_e' in locals() else e
+                 try: await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=f"❌ Fallback/Doc fail: {str(final_fallback_error)[:100]}")
+                 except Exception: pass
 
-        # --- Check Success / Final Status / Cleanup ---
-        if not sent_message: # Check upload success
+        if not sent_message:
             logger.error(f"Upload failed {base_filename}. Mode: {upload_mode_str}"); final_error_text = f"❌ Upload failed ({upload_mode_str}): {caption}"
-            # Edit/send failure message
             if status_message_id: try: await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=final_error_text)
             except Exception: await pyrogram_client.send_message(chat_id=original_chat_id, text=final_error_text)
             elif original_chat_id: await pyrogram_client.send_message(chat_id=original_chat_id, text=final_error_text)
-            # Cleanup temp thumb on failure
             if temp_thumb_path and os.path.exists(temp_thumb_path): try: os.remove(temp_thumb_path); logger.info("Cleaned temp thumb after fail.")
             except Exception as e_del: logger.error(f"Error deleting temp thumb after fail: {e_del}")
             return False
-        # Final Success Message
         final_message = f"✅ Upload OK ({upload_mode_str}): {caption}"; logger.info(f"Upload finish: '{base_filename}' ({upload_mode_str}) -> {upload_destination_chat_id}")
         if upload_destination_chat_id != original_chat_id: final_message += f"\n(Sent -> ID: {upload_destination_chat_id})"
         if status_message_id: try: await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=final_message)
         except Exception: await pyrogram_client.send_message(original_chat_id, final_message)
         elif original_chat_id: await pyrogram_client.send_message(original_chat_id, final_message)
-        # Delete Local File(s)
         if delete_after_upload:
              try: os.remove(file_path); logger.info(f"Deleted data: {file_path}"); await ptb_context.bot.send_message(original_chat_id, f"🗑️ Local data deleted: {caption}", disable_notification=True)
              except OSError as e: logger.error(f"Failed delete {file_path}: {e}"); await ptb_context.bot.send_message(original_chat_id, f"⚠️ Failed delete data: {caption}\n{e}")
-        # Always delete temp thumb if created
         if temp_thumb_path and os.path.exists(temp_thumb_path): try: os.remove(temp_thumb_path); logger.info("Cleaned temp thumbnail.")
         except Exception as e_del: logger.error(f"Error deleting temp thumb: {e_del}")
         return True
 
-    # --- Error Handling (Outer Try) ---
     except FloodWait as fw:
         logger.warning(f"Upload FloodWait: {fw.value}s"); wait_time = fw.value + 2; error_text=f"⏳ Flood wait {wait_time}s..."; final_error_text=f"❌ Upload failed (FloodWait): {caption}"
         if status_message_id: try: await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=error_text); await asyncio.sleep(wait_time); await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=final_error_text)
