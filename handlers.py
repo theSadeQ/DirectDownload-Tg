@@ -1,6 +1,6 @@
 # handlers.py
 # Contains PTB handlers, conversation logic, and the reporting helper.
-# Force written by Cell 3 to ensure correctness.
+# Final version incorporating all features and fixes.
 
 import logging
 import asyncio
@@ -24,12 +24,10 @@ try:
         extract_filename_from_url,
         clean_filename,
         write_failed_downloads_to_file,
-        apply_dot_style
+        apply_dot_style # For manual filename styling
     )
 except ImportError as e:
-    logging.basicConfig(level=logging.ERROR)
-    logging.error(f"Failed import from utils.py: {e}")
-    raise
+    logging.basicConfig(level=logging.ERROR); logging.error(f"Failed import from utils.py: {e}"); raise
 
 # Import downloaders
 try:
@@ -38,9 +36,7 @@ try:
         download_multiple_files_deltaleech,
         download_multiple_files_bitso
     )
-except ImportError as e:
-    logging.error(f"Failed import from downloaders.py: {e}")
-    raise
+except ImportError as e: logging.error(f"Failed import from downloaders.py: {e}"); raise
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +44,7 @@ logger = logging.getLogger(__name__)
 CHOOSE_DOWNLOADER, GET_URLS, GET_FILENAMES_NZB, \
 GET_FILENAMES_DELTA, CONFIRM_DELTA_FN, \
 GET_URLS_BITSO, CONFIRM_BITSO_FN, GET_FILENAMES_BITSO = range(8)
+
 
 # --- Helper for Running and Reporting ---
 async def run_and_report_process(update: Update, context: ContextTypes.DEFAULT_TYPE, download_upload_task, service_name: str):
@@ -147,24 +144,24 @@ async def get_filenames_delta(update: Update, context: ContextTypes.DEFAULT_TYPE
     fns_raw=[fn.strip() for fn in update.message.text.splitlines() if fn.strip()]; urls=context.user_data['urls']
     if not fns_raw: await update.message.reply_text("⚠️ No FNs. Send again or /cancel."); return GET_FILENAMES_DELTA
     if len(urls)!=len(fns_raw): await update.message.reply_text(f"❌ Error: {len(fns_raw)} FNs != {len(urls)} URLs."); return GET_FILENAMES_DELTA
-    cleaned_fns = [clean_filename(fn) for fn in fns_raw]; styled_fns = [apply_dot_style(fn) for fn in cleaned_fns] # Apply style
+    cleaned_fns = [clean_filename(fn) for fn in fns_raw]; styled_fns = [apply_dot_style(fn) for fn in cleaned_fns]
     context.user_data['filenames']=styled_fns; logger.info(f"Got {len(styled_fns)} manual styled FNs for delta: {styled_fns[:3]}...")
     await update.message.reply_text("✅ Got styled filenames.\n⏳ Starting Delta (cf=None)...")
     cf=None; pyro_client=context.bot_data.get('pyrogram_client')
     if not pyro_client: await update.message.reply_text("🚨 Error: Cannot upload.")
-    else: asyncio.create_task(run_and_report_process(update, context, download_multiple_files_deltaleech(urls, styled_fns, cf, update, context, pyro_client), "deltaleech")) # Use styled_fns
+    else: asyncio.create_task(run_and_report_process(update, context, download_multiple_files_deltaleech(urls, styled_fns, cf, update, context, pyro_client), "deltaleech"))
     context.user_data.clear(); return ConversationHandler.END
 
 async def get_filenames_nzb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     fns_raw=[fn.strip() for fn in update.message.text.splitlines() if fn.strip()]; urls=context.user_data['urls']
     if not fns_raw: await update.message.reply_text("⚠️ No FNs. Send again or /cancel."); return GET_FILENAMES_NZB
     if len(urls)!=len(fns_raw): await update.message.reply_text(f"❌ Error: {len(fns_raw)} FNs != {len(urls)} URLs."); return GET_FILENAMES_NZB
-    cleaned_fns = [clean_filename(fn) for fn in fns_raw]; styled_fns = [apply_dot_style(fn) for fn in cleaned_fns] # Apply style
+    cleaned_fns = [clean_filename(fn) for fn in fns_raw]; styled_fns = [apply_dot_style(fn) for fn in cleaned_fns]
     context.user_data['filenames']=styled_fns; logger.info(f"Got {len(styled_fns)} styled FNs for nzb: {styled_fns[:3]}...")
     await update.message.reply_text("✅ Got styled filenames.\n⏳ Starting nzbCloud (cf=None)...")
     cf=None; pyro_client=context.bot_data.get('pyrogram_client')
     if not pyro_client: await update.message.reply_text("🚨 Error: Cannot upload.")
-    else: asyncio.create_task(run_and_report_process(update, context, download_files_nzbcloud(urls, styled_fns, cf, update, context, pyro_client), "nzbcloud")) # Use styled_fns
+    else: asyncio.create_task(run_and_report_process(update, context, download_files_nzbcloud(urls, styled_fns, cf, update, context, pyro_client), "nzbcloud"))
     context.user_data.clear(); return ConversationHandler.END
 
 async def confirm_bitso_filenames(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -185,12 +182,12 @@ async def get_filenames_bitso(update: Update, context: ContextTypes.DEFAULT_TYPE
     fns_raw=[fn.strip() for fn in update.message.text.splitlines() if fn.strip()]; urls=context.user_data['urls']
     if not fns_raw: await update.message.reply_text("⚠️ No FNs received. Send again or /cancel."); return GET_FILENAMES_BITSO
     if len(urls)!=len(fns_raw): await update.message.reply_text(f"❌ Error: {len(fns_raw)} FNs != {len(urls)} URLs."); return GET_FILENAMES_BITSO
-    cleaned_fns = [clean_filename(fn) for fn in fns_raw]; styled_fns = [apply_dot_style(fn) for fn in cleaned_fns] # Apply style
+    cleaned_fns = [clean_filename(fn) for fn in fns_raw]; styled_fns = [apply_dot_style(fn) for fn in cleaned_fns]
     context.user_data['filenames']=styled_fns; logger.info(f"Got {len(styled_fns)} manual styled FNs for Bitso: {styled_fns[:3]}...")
     await update.message.reply_text("✅ Got styled filenames.\n⏳ Starting Bitso process (cookies=None)...")
     id_c=None; sess_c=None; ref_url="https://panel.bitso.ir/"; pyro_client=context.bot_data.get('pyrogram_client')
     if not pyro_client: await update.message.reply_text("🚨 Error: Cannot upload.")
-    else: asyncio.create_task(run_and_report_process(update, context, download_multiple_files_bitso(urls, styled_fns, ref_url, id_c, sess_c, update, context, pyro_client), "bitso")) # Use styled_fns
+    else: asyncio.create_task(run_and_report_process(update, context, download_multiple_files_bitso(urls, styled_fns, ref_url, id_c, sess_c, update, context, pyro_client), "bitso"))
     context.user_data.clear(); return ConversationHandler.END
 
 # --- Build Conversation Handler ---
@@ -213,6 +210,3 @@ conv_handler = ConversationHandler(
         MessageHandler(filters.COMMAND, lambda u,c: u.message.reply_text("Finish or /cancel first.")),
     ],
 )
-
-# Print success message for Colab %%writefile magic
-print("handlers.py written successfully.")
