@@ -1,5 +1,6 @@
-python-telegram-bot>=20.0  # Specify a version range if needed
+python-telegram-bot>=20.0
 requests>=2.25
-pyrogram>=2.0
+pyrofork==2.2.11  # <-- Changed from pyrogram
 tgcrypto>=1.2
 nest_asyncio>=1.5
+httpx
