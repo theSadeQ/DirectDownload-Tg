@@ -20,24 +20,67 @@ from telegram.error import BadRequest as PTBBadRequest
 
 logger = logging.getLogger(__name__)
 
-# --- Helper Function to Download Thumbnail ---
+# --- NEW Helper Function to Download Thumbnail ---
+# Make sure requests, asyncio, tempfile, os, logging are imported at the top of upload.py
 async def _download_thumb(url: str) -> str | None:
     """Downloads image URL to a temporary file, returns path or None."""
     temp_thumb_path = None
+    response = None # Initialize response outside try
     try:
-        response = await asyncio.to_thread(requests.get, url, stream=True, timeout=10); response.raise_for_status()
-        content_type = response.headers.get('content-type')
-        if not content_type or not content_type.startswith('image/'): logger.warning(f"Thumb URL not image: {content_type} ({url})"); return None
-        suffix = ".jpg";
-        if 'png' in content_type: suffix = ".png"; elif 'webp' in content_type: suffix = ".webp"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
-            for chunk in response.iter_content(chunk_size=8192): temp_file.write(chunk)
-            temp_thumb_path = temp_file.name; logger.info(f"Thumb downloaded to temp: {temp_thumb_path}")
-    except requests.exceptions.RequestException as e: logger.error(f"Failed DL thumb URL {url}: {e}"); temp_thumb_path = None
-    except Exception as e: logger.error(f"Unexpected thumb DL error {url}: {e}", exc_info=True); temp_thumb_path = None
+        # Use asyncio.to_thread for synchronous requests call
+        logger.debug(f"Downloading thumbnail from: {url}")
+        response = await asyncio.to_thread(requests.get, url, stream=True, timeout=15) # Slightly longer timeout
+        response.raise_for_status()
+
+        # Check content type
+        content_type = response.headers.get('content-type', '').lower()
+        # More robust check for image types
+        if not content_type.startswith('image/'):
+            logger.warning(f"Thumbnail URL content-type is not image: {content_type} ({url})")
+            return None # Return None if not an image type
+
+        # Create a temporary file
+        # Determine suffix based on content type
+        suffix = ".jpg" # Default
+        if 'png' in content_type: suffix = ".png"
+        elif 'webp' in content_type: suffix = ".webp"
+        elif 'gif' in content_type: suffix = ".gif"
+        # Add other types if needed
+
+        # Use tempfile for safer temporary file creation
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, prefix="thumb_") as temp_file:
+            downloaded_bytes = 0
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk: # filter out keep-alive new chunks
+                    temp_file.write(chunk)
+                    downloaded_bytes += len(chunk)
+            temp_thumb_path = temp_file.name # Get the path
+            logger.info(f"Thumbnail ({downloaded_bytes} bytes) downloaded successfully to temp file: {temp_thumb_path}")
+
+    except requests.exceptions.Timeout:
+         logger.error(f"Timeout error downloading thumbnail URL {url}")
+         temp_thumb_path = None
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to download thumbnail URL {url}: {e}")
+        temp_thumb_path = None
+    except Exception as e:
+         logger.error(f"An unexpected error occurred downloading thumbnail {url}: {e}", exc_info=True)
+         temp_thumb_path = None
     finally:
-        if 'response' in locals() and response: response.close()
-    return temp_thumb_path
+        # Ensure response is closed
+        if response is not None:
+            response.close()
+
+    # Return the path only if download succeeded and path was set
+    if temp_thumb_path and os.path.exists(temp_thumb_path):
+        return temp_thumb_path
+    else:
+        # Ensure cleanup if temp file was created but something failed after
+        if temp_thumb_path and os.path.exists(temp_thumb_path):
+            try: os.remove(temp_thumb_path)
+            except Exception: pass
+        return None
+# --- End Helper Function ---
 
 # --- Main Upload Function ---
 async def upload_file_pyrogram(
