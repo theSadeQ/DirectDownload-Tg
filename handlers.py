@@ -1,5 +1,6 @@
 # handlers.py
-# FINAL VERSION: Includes all features and fixes.
+# Contains PTB handlers, conversation logic, and the reporting helper.
+# Force written by Cell 3 to ensure correctness.
 
 import logging
 import asyncio
@@ -27,7 +28,7 @@ try:
     )
 except ImportError as e:
     logging.basicConfig(level=logging.ERROR)
-    logging.error(f"Failed to import from utils.py: {e}. Ensure utils.py exists and is correct.")
+    logging.error(f"Failed import from utils.py: {e}")
     raise
 
 # Import downloaders
@@ -38,7 +39,7 @@ try:
         download_multiple_files_bitso
     )
 except ImportError as e:
-    logging.error(f"Failed to import from downloaders.py: {e}. Ensure downloaders.py exists and is correct.")
+    logging.error(f"Failed import from downloaders.py: {e}")
     raise
 
 logger = logging.getLogger(__name__)
@@ -48,10 +49,8 @@ CHOOSE_DOWNLOADER, GET_URLS, GET_FILENAMES_NZB, \
 GET_FILENAMES_DELTA, CONFIRM_DELTA_FN, \
 GET_URLS_BITSO, CONFIRM_BITSO_FN, GET_FILENAMES_BITSO = range(8)
 
-
 # --- Helper for Running and Reporting ---
 async def run_and_report_process(update: Update, context: ContextTypes.DEFAULT_TYPE, download_upload_task, service_name: str):
-    # ... (function unchanged) ...
     chat_id = update.effective_chat.id; failed_sources = []
     download_dir = context.bot_data.get('download_dir', '/content/downloads')
     try:
@@ -78,39 +77,25 @@ async def run_and_report_process(update: Update, context: ContextTypes.DEFAULT_T
 
 # --- Simple Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # ... (function unchanged) ...
     user = update.effective_user; upload_enabled = context.bot_data.get('upload_enabled', True); upload_mode = context.bot_data.get('upload_mode', 'N/A'); delete_after_upload = context.bot_data.get('delete_after_upload', True)
     cred_status = "API/Token Configured." if context.bot_data.get('pyrogram_client') else "⚠️ API/Token Error!"; upload_status = f"✅ Uploads ON (Mode: {upload_mode})." if upload_enabled else "ℹ️ Uploads OFF."; delete_status = f"🗑️ Delete ON." if upload_enabled and delete_after_upload else "💾 Delete OFF."
     await update.message.reply_html(rf"Hi {user.mention_html()}!\n\n{cred_status}\n{upload_status}\n{delete_status}\n\nUse /download to start.",)
 
-# --- CORRECTED cancel function ---
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """ Cancels and ends the conversation. Restored fallback logic."""
     user_id = update.effective_user.id if update.effective_user else "Unknown"; logger.info(f"User {user_id} cancelled.")
     message_text = "Download process cancelled."; query = update.callback_query
     try:
-        if query:
-            await query.answer()
-            await query.edit_message_text(message_text)
-        elif update.message:
-            await update.message.reply_text(message_text)
+        if query: await query.answer(); await query.edit_message_text(message_text)
+        elif update.message: await update.message.reply_text(message_text)
     except Exception as e:
         logger.warning(f"Failed send/edit cancel confirmation: {e}")
-        # Nested try starts on a new line, indented under except
-        try:
-            # Attempt to send a new message if editing failed
-            await context.bot.send_message(update.effective_chat.id, message_text)
-        except Exception as send_e:
-            logger.error(f"Failed sending cancel confirmation fallback: {send_e}")
+        try: await context.bot.send_message(update.effective_chat.id, message_text)
+        except Exception as send_e: logger.error(f"Failed sending cancel confirmation fallback: {send_e}")
     context.user_data.clear(); return ConversationHandler.END
-# --- END CORRECTED cancel function ---
 
 # --- Conversation Handlers ---
-
-# Helper Function to process URLs
 async def _process_urls_and_proceed(urls: list[str], update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # ... (function unchanged) ...
-    if not urls: await update.message.reply_text("⚠️ No valid HTTP(S) URLs found. Send again or /cancel."); current_downloader = context.user_data.get('downloader'); return GET_URLS_BITSO if current_downloader == 'bitso' else GET_URLS
+    if not urls: await update.message.reply_text("⚠️ No valid HTTP(S) URLs found."); current_downloader = context.user_data.get('downloader'); return GET_URLS_BITSO if current_downloader == 'bitso' else GET_URLS
     context.user_data['urls'] = urls; downloader = context.user_data.get('downloader', 'N/A'); logger.info(f"Processed {len(urls)} URLs for {downloader}.")
     if downloader == 'nzbcloud': await update.message.reply_text(f"✅ Got {len(urls)} URL(s).\nSend FN(s):"); return GET_FILENAMES_NZB
     elif downloader == 'deltaleech': kb = [[InlineKeyboardButton("Extract FNs", callback_data='delta_use_url_fn')],[InlineKeyboardButton("Provide FNs", callback_data='delta_manual_fn')],[InlineKeyboardButton("Cancel", callback_data='cancel')]]; await update.message.reply_text(f"✅ Got {len(urls)} URL(s).\nFilenames?", reply_markup=InlineKeyboardMarkup(kb)); return CONFIRM_DELTA_FN
@@ -118,13 +103,11 @@ async def _process_urls_and_proceed(urls: list[str], update: Update, context: Co
     else: logger.error(f"Unknown downloader '{downloader}'."); await update.message.reply_text("Internal error."); return ConversationHandler.END
 
 async def start_download_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-     # ... (function unchanged) ...
      if 'pyrogram_client' not in context.bot_data: await update.message.reply_text("⚠️ Bot init error."); return ConversationHandler.END
      kb = [[InlineKeyboardButton(s, callback_data=s.lower().split()[1]) for s in ["☁️ nzbCloud", "💧 DeltaLeech", "🪙 Bitso"]], [InlineKeyboardButton("❌ Cancel", callback_data='cancel')]]
      await update.message.reply_text("Choose service:", reply_markup=InlineKeyboardMarkup(kb)); return CHOOSE_DOWNLOADER
 
 async def choose_downloader(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # ... (function unchanged) ...
     query = update.callback_query; await query.answer(); downloader = query.data; context.user_data['downloader'] = downloader; logger.info(f"User {update.effective_user.id} chose: {downloader}");
     if downloader == 'cancel': return await cancel(update, context)
     message_text = f"Selected: <b>{downloader}</b>\nSend URL(s) (one per line or upload .txt):"; await query.edit_message_text(message_text, parse_mode=ParseMode.HTML)
@@ -132,13 +115,11 @@ async def choose_downloader(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     elif downloader == 'bitso': return GET_URLS_BITSO
     else: await query.edit_message_text("Error."); return ConversationHandler.END
 
-# Handles text/file input (Unchanged)
 async def get_urls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     logger.info("Handling text in GET_URLS."); urls = [url for url in update.message.text.splitlines() if url.strip().lower().startswith(('http://', 'https://'))]; return await _process_urls_and_proceed(urls, update, context)
 async def get_urls_bitso(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     logger.info("Handling text in GET_URLS_BITSO."); urls = [url for url in update.message.text.splitlines() if url.strip().lower().startswith(('http://', 'https://'))]; return await _process_urls_and_proceed(urls, update, context)
 async def handle_url_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # ... (function unchanged) ...
     logger.info("Handling document."); doc = update.message.document; current_downloader = context.user_data.get('downloader'); current_state = GET_URLS_BITSO if current_downloader == 'bitso' else GET_URLS
     if not doc or not doc.file_name or not doc.file_name.lower().endswith(".txt"): await update.message.reply_text("Please upload `.txt` file."); return current_state
     MAX_TXT_SIZE = 1*1024*1024;
@@ -148,9 +129,7 @@ async def handle_url_file(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception as e: logger.error(f"Error processing URL file: {e}", exc_info=True); await update.message.reply_text(f"❌ Error processing file: {e}"); return current_state
     urls = [url for url in file_content_str.splitlines() if url.strip().lower().startswith(('http://', 'https://'))]; logger.info(f"Extracted {len(urls)} URLs from '{doc.file_name}'."); return await _process_urls_and_proceed(urls, update, context)
 
-# --- DeltaLeech Specific Handlers (Unchanged) ---
 async def confirm_delta_filenames(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # ... (function unchanged) ...
     query = update.callback_query; await query.answer(); choice = query.data; urls = context.user_data['urls']
     if choice == 'cancel': return await cancel(update, context)
     if choice == 'delta_use_url_fn':
@@ -165,35 +144,30 @@ async def confirm_delta_filenames(update: Update, context: ContextTypes.DEFAULT_
     else: return ConversationHandler.END
 
 async def get_filenames_delta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # ... (function unchanged - includes styling) ...
     fns_raw=[fn.strip() for fn in update.message.text.splitlines() if fn.strip()]; urls=context.user_data['urls']
     if not fns_raw: await update.message.reply_text("⚠️ No FNs. Send again or /cancel."); return GET_FILENAMES_DELTA
     if len(urls)!=len(fns_raw): await update.message.reply_text(f"❌ Error: {len(fns_raw)} FNs != {len(urls)} URLs."); return GET_FILENAMES_DELTA
-    cleaned_fns = [clean_filename(fn) for fn in fns_raw]; styled_fns = [apply_dot_style(fn) for fn in cleaned_fns]
+    cleaned_fns = [clean_filename(fn) for fn in fns_raw]; styled_fns = [apply_dot_style(fn) for fn in cleaned_fns] # Apply style
     context.user_data['filenames']=styled_fns; logger.info(f"Got {len(styled_fns)} manual styled FNs for delta: {styled_fns[:3]}...")
     await update.message.reply_text("✅ Got styled filenames.\n⏳ Starting Delta (cf=None)...")
     cf=None; pyro_client=context.bot_data.get('pyrogram_client')
     if not pyro_client: await update.message.reply_text("🚨 Error: Cannot upload.")
-    else: asyncio.create_task(run_and_report_process(update, context, download_multiple_files_deltaleech(urls, styled_fns, cf, update, context, pyro_client), "deltaleech"))
+    else: asyncio.create_task(run_and_report_process(update, context, download_multiple_files_deltaleech(urls, styled_fns, cf, update, context, pyro_client), "deltaleech")) # Use styled_fns
     context.user_data.clear(); return ConversationHandler.END
 
-# --- nzbCloud Specific Handlers (Unchanged) ---
 async def get_filenames_nzb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # ... (function unchanged - includes styling) ...
     fns_raw=[fn.strip() for fn in update.message.text.splitlines() if fn.strip()]; urls=context.user_data['urls']
     if not fns_raw: await update.message.reply_text("⚠️ No FNs. Send again or /cancel."); return GET_FILENAMES_NZB
     if len(urls)!=len(fns_raw): await update.message.reply_text(f"❌ Error: {len(fns_raw)} FNs != {len(urls)} URLs."); return GET_FILENAMES_NZB
-    cleaned_fns = [clean_filename(fn) for fn in fns_raw]; styled_fns = [apply_dot_style(fn) for fn in cleaned_fns]
+    cleaned_fns = [clean_filename(fn) for fn in fns_raw]; styled_fns = [apply_dot_style(fn) for fn in cleaned_fns] # Apply style
     context.user_data['filenames']=styled_fns; logger.info(f"Got {len(styled_fns)} styled FNs for nzb: {styled_fns[:3]}...")
     await update.message.reply_text("✅ Got styled filenames.\n⏳ Starting nzbCloud (cf=None)...")
     cf=None; pyro_client=context.bot_data.get('pyrogram_client')
     if not pyro_client: await update.message.reply_text("🚨 Error: Cannot upload.")
-    else: asyncio.create_task(run_and_report_process(update, context, download_files_nzbcloud(urls, styled_fns, cf, update, context, pyro_client), "nzbcloud"))
+    else: asyncio.create_task(run_and_report_process(update, context, download_files_nzbcloud(urls, styled_fns, cf, update, context, pyro_client), "nzbcloud")) # Use styled_fns
     context.user_data.clear(); return ConversationHandler.END
 
-# --- Bitso Specific Handlers ---
 async def confirm_bitso_filenames(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # ... (function unchanged) ...
     query = update.callback_query; await query.answer(); choice = query.data; urls = context.user_data['urls']
     if choice == 'cancel': return await cancel(update, context)
     if choice == 'bitso_use_url_fn':
@@ -208,20 +182,18 @@ async def confirm_bitso_filenames(update: Update, context: ContextTypes.DEFAULT_
     else: return ConversationHandler.END
 
 async def get_filenames_bitso(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # ... (function unchanged - includes styling) ...
     fns_raw=[fn.strip() for fn in update.message.text.splitlines() if fn.strip()]; urls=context.user_data['urls']
     if not fns_raw: await update.message.reply_text("⚠️ No FNs received. Send again or /cancel."); return GET_FILENAMES_BITSO
     if len(urls)!=len(fns_raw): await update.message.reply_text(f"❌ Error: {len(fns_raw)} FNs != {len(urls)} URLs."); return GET_FILENAMES_BITSO
-    cleaned_fns = [clean_filename(fn) for fn in fns_raw]; styled_fns = [apply_dot_style(fn) for fn in cleaned_fns]
+    cleaned_fns = [clean_filename(fn) for fn in fns_raw]; styled_fns = [apply_dot_style(fn) for fn in cleaned_fns] # Apply style
     context.user_data['filenames']=styled_fns; logger.info(f"Got {len(styled_fns)} manual styled FNs for Bitso: {styled_fns[:3]}...")
     await update.message.reply_text("✅ Got styled filenames.\n⏳ Starting Bitso process (cookies=None)...")
     id_c=None; sess_c=None; ref_url="https://panel.bitso.ir/"; pyro_client=context.bot_data.get('pyrogram_client')
     if not pyro_client: await update.message.reply_text("🚨 Error: Cannot upload.")
-    else: asyncio.create_task(run_and_report_process(update, context, download_multiple_files_bitso(urls, styled_fns, ref_url, id_c, sess_c, update, context, pyro_client), "bitso"))
+    else: asyncio.create_task(run_and_report_process(update, context, download_multiple_files_bitso(urls, styled_fns, ref_url, id_c, sess_c, update, context, pyro_client), "bitso")) # Use styled_fns
     context.user_data.clear(); return ConversationHandler.END
 
-
-# --- Build Conversation Handler (Unchanged) ---
+# --- Build Conversation Handler ---
 conv_handler = ConversationHandler(
     entry_points=[CommandHandler("download", start_download_conv)],
     states={
@@ -241,3 +213,6 @@ conv_handler = ConversationHandler(
         MessageHandler(filters.COMMAND, lambda u,c: u.message.reply_text("Finish or /cancel first.")),
     ],
 )
+
+# Print success message for Colab %%writefile magic
+print("handlers.py written successfully.")
