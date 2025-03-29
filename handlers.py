@@ -1,6 +1,6 @@
 # handlers.py
 # Contains PTB handlers, conversation logic, and the reporting helper.
-# Final version incorporating all features and fixes.
+# Force written by Cell 3 to ensure correctness.
 
 import logging
 import asyncio
@@ -24,10 +24,12 @@ try:
         extract_filename_from_url,
         clean_filename,
         write_failed_downloads_to_file,
-        apply_dot_style # For manual filename styling
+        apply_dot_style
     )
 except ImportError as e:
-    logging.basicConfig(level=logging.ERROR); logging.error(f"Failed import from utils.py: {e}"); raise
+    logging.basicConfig(level=logging.ERROR)
+    logging.error(f"Failed import from utils.py: {e}")
+    raise
 
 # Import downloaders
 try:
@@ -36,7 +38,9 @@ try:
         download_multiple_files_deltaleech,
         download_multiple_files_bitso
     )
-except ImportError as e: logging.error(f"Failed import from downloaders.py: {e}"); raise
+except ImportError as e:
+    logging.error(f"Failed import from downloaders.py: {e}")
+    raise
 
 logger = logging.getLogger(__name__)
 
@@ -210,3 +214,6 @@ conv_handler = ConversationHandler(
         MessageHandler(filters.COMMAND, lambda u,c: u.message.reply_text("Finish or /cancel first.")),
     ],
 )
+
+# Print success message for Colab %%writefile magic
+print("handlers.py written successfully.")
