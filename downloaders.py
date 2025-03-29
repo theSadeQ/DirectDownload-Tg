@@ -14,7 +14,8 @@ from pyrogram import Client
 from telegram import Update
 from telegram.ext import ContextTypes
 # Import specific PTB errors for message editing
-from telegram.error import BadRequest as PTBBadRequest, Flood as PTBFlood
+# Corrected import
+from telegram.error import BadRequest as PTBBadRequest, RetryAfter
 
 # Import local helpers/config
 from upload import upload_file_pyrogram
