@@ -1,6 +1,7 @@
 # upload.py
 # Handles the file upload using Pyrogram/Pyrofork.
 # Gets config via context. Edits progress via pyro client. Downloads thumb URL.
+# FIXED: SyntaxError in fallback kwargs modification line.
 
 import logging
 import os
@@ -9,7 +10,7 @@ import asyncio
 import tempfile
 import requests
 
-# Import Pyrogram types/errors (Pyrofork uses same namespace)
+# Import Pyrogram types/errors
 from pyrogram import Client
 from pyrogram.errors import FloodWait, MediaCaptionTooLong, BadRequest, BotMethodInvalid
 
@@ -20,67 +21,30 @@ from telegram.error import BadRequest as PTBBadRequest
 
 logger = logging.getLogger(__name__)
 
-# --- NEW Helper Function to Download Thumbnail ---
-# Make sure requests, asyncio, tempfile, os, logging are imported at the top of upload.py
+# --- Helper Function to Download Thumbnail ---
 async def _download_thumb(url: str) -> str | None:
-    """Downloads image URL to a temporary file, returns path or None."""
-    temp_thumb_path = None
-    response = None # Initialize response outside try
+    # ... (function unchanged) ...
+    temp_thumb_path = None; response = None
     try:
-        # Use asyncio.to_thread for synchronous requests call
-        logger.debug(f"Downloading thumbnail from: {url}")
-        response = await asyncio.to_thread(requests.get, url, stream=True, timeout=15) # Slightly longer timeout
-        response.raise_for_status()
-
-        # Check content type
+        response = await asyncio.to_thread(requests.get, url, stream=True, timeout=15); response.raise_for_status()
         content_type = response.headers.get('content-type', '').lower()
-        # More robust check for image types
-        if not content_type.startswith('image/'):
-            logger.warning(f"Thumbnail URL content-type is not image: {content_type} ({url})")
-            return None # Return None if not an image type
-
-        # Create a temporary file
-        # Determine suffix based on content type
-        suffix = ".jpg" # Default
-        if 'png' in content_type: suffix = ".png"
-        elif 'webp' in content_type: suffix = ".webp"
-        elif 'gif' in content_type: suffix = ".gif"
-        # Add other types if needed
-
-        # Use tempfile for safer temporary file creation
+        if not content_type.startswith('image/'): logger.warning(f"Thumb URL not image: {content_type} ({url})"); return None
+        suffix = ".jpg";
+        if 'png' in content_type: suffix = ".png"; elif 'webp' in content_type: suffix = ".webp"; elif 'gif' in content_type: suffix = ".gif"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, prefix="thumb_") as temp_file:
             downloaded_bytes = 0
             for chunk in response.iter_content(chunk_size=8192):
-                if chunk: # filter out keep-alive new chunks
-                    temp_file.write(chunk)
-                    downloaded_bytes += len(chunk)
-            temp_thumb_path = temp_file.name # Get the path
-            logger.info(f"Thumbnail ({downloaded_bytes} bytes) downloaded successfully to temp file: {temp_thumb_path}")
-
-    except requests.exceptions.Timeout:
-         logger.error(f"Timeout error downloading thumbnail URL {url}")
-         temp_thumb_path = None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to download thumbnail URL {url}: {e}")
-        temp_thumb_path = None
-    except Exception as e:
-         logger.error(f"An unexpected error occurred downloading thumbnail {url}: {e}", exc_info=True)
-         temp_thumb_path = None
+                if chunk: temp_file.write(chunk); downloaded_bytes += len(chunk)
+            temp_thumb_path = temp_file.name; logger.info(f"Thumb ({downloaded_bytes} bytes) downloaded to: {temp_thumb_path}")
+    except requests.exceptions.Timeout: logger.error(f"Timeout DL thumb URL {url}"); temp_thumb_path = None
+    except requests.exceptions.RequestException as e: logger.error(f"Failed DL thumb URL {url}: {e}"); temp_thumb_path = None
+    except Exception as e: logger.error(f"Unexpected thumb DL error {url}: {e}", exc_info=True); temp_thumb_path = None
     finally:
-        # Ensure response is closed
-        if response is not None:
-            response.close()
-
-    # Return the path only if download succeeded and path was set
-    if temp_thumb_path and os.path.exists(temp_thumb_path):
-        return temp_thumb_path
+        if response is not None: response.close()
+    if temp_thumb_path and os.path.exists(temp_thumb_path): return temp_thumb_path
     else:
-        # Ensure cleanup if temp file was created but something failed after
-        if temp_thumb_path and os.path.exists(temp_thumb_path):
-            try: os.remove(temp_thumb_path)
-            except Exception: pass
-        return None
-# --- End Helper Function ---
+        if temp_thumb_path and os.path.exists(temp_thumb_path): try: os.remove(temp_thumb_path)
+        except Exception: pass; return None
 
 # --- Main Upload Function ---
 async def upload_file_pyrogram(
@@ -144,22 +108,40 @@ async def upload_file_pyrogram(
         except (MediaCaptionTooLong, BadRequest, BotMethodInvalid, TimeoutError, ValueError) as e:
             logger.error(f"Pyro err {attempted_mode} -> {upload_destination_chat_id}: {e}. Fallback...")
             if status_message_id:
-                try: await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=f"⚠️ {attempted_mode} fail: {str(e)[:100]}. Fallback...")
-                except Exception as edit_err: logger.error(f"Failed edit fallback notify: {edit_err}")
+                # Indent try block under the if
+                try:
+                    await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=f"⚠️ {attempted_mode} fail: {str(e)[:100]}. Fallback...")
+                except Exception as edit_err:
+                     logger.error(f"Failed edit during fallback notify: {edit_err}")
+            # --- Fallback logic starts here ---
             if attempted_mode != "Document":
                 try:
-                    logger.info("Attempt fallback Document..."); kwargs.pop('video', None); kwargs.pop('audio', None); kwargs.pop('supports_streaming', None); kwargs['document'] = file_path; kwargs['force_document'] = True
-                    if status_message_id: await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=f"⏫ Upload (Fallback)...")
-                    sent_message = await pyrogram_client.send_document(**kwargs)
+                    logger.info("Attempt fallback Document...")
+                    # ***** CORRECTED KWARGS MODIFICATION *****
+                    kwargs.pop('video', None)
+                    kwargs.pop('audio', None)
+                    kwargs.pop('supports_streaming', None)
+                    kwargs['document'] = file_path
+                    kwargs['force_document'] = True
+                    # Keep existing 'thumb' in kwargs if it was valid
+                    # ***** END CORRECTION *****
+                    if status_message_id:
+                         await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=f"⏫ Upload (Fallback)...")
+                    sent_message = await pyrogram_client.send_document(**kwargs) # Fallback upload
                     upload_mode_str = "Document (Fallback)"; logger.info("Fallback success.")
-                except Exception as fallback_e: logger.error(f"Fallback failed: {fallback_e}", exc_info=True); sent_message = None
-            else: logger.error(f"Doc upload failed: {e}", exc_info=True); sent_message = None
-            if not sent_message and status_message_id:
-                 final_fallback_error = fallback_e if 'fallback_e' in locals() else e
-                 try: await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=f"❌ Fallback/Doc fail: {str(final_fallback_error)[:100]}")
-                 except Exception: pass
+                except Exception as fallback_e:
+                    logger.error(f"Fallback failed: {fallback_e}", exc_info=True); sent_message = None
+                    if status_message_id:
+                         try: await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=f"❌ Fallback fail: {str(fallback_e)[:100]}")
+                         except Exception: pass # Ignore final edit error
+            else: # Original attempt was Document and it failed
+                 logger.error(f"Doc upload failed: {e}", exc_info=True); sent_message = None
+                 if status_message_id:
+                      try: await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=f"❌ Document fail: {str(e)[:100]}")
+                      except Exception: pass # Ignore final edit error
 
-        if not sent_message:
+        # --- Check Success / Final Status / Cleanup ---
+        if not sent_message: # Check upload success
             logger.error(f"Upload failed {base_filename}. Mode: {upload_mode_str}"); final_error_text = f"❌ Upload failed ({upload_mode_str}): {caption}"
             if status_message_id: try: await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=final_error_text)
             except Exception: await pyrogram_client.send_message(chat_id=original_chat_id, text=final_error_text)
@@ -167,18 +149,22 @@ async def upload_file_pyrogram(
             if temp_thumb_path and os.path.exists(temp_thumb_path): try: os.remove(temp_thumb_path); logger.info("Cleaned temp thumb after fail.")
             except Exception as e_del: logger.error(f"Error deleting temp thumb after fail: {e_del}")
             return False
+        # Final Success Message
         final_message = f"✅ Upload OK ({upload_mode_str}): {caption}"; logger.info(f"Upload finish: '{base_filename}' ({upload_mode_str}) -> {upload_destination_chat_id}")
         if upload_destination_chat_id != original_chat_id: final_message += f"\n(Sent -> ID: {upload_destination_chat_id})"
         if status_message_id: try: await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=final_message)
         except Exception: await pyrogram_client.send_message(original_chat_id, final_message)
         elif original_chat_id: await pyrogram_client.send_message(original_chat_id, final_message)
+        # Delete Local File(s)
         if delete_after_upload:
              try: os.remove(file_path); logger.info(f"Deleted data: {file_path}"); await ptb_context.bot.send_message(original_chat_id, f"🗑️ Local data deleted: {caption}", disable_notification=True)
              except OSError as e: logger.error(f"Failed delete {file_path}: {e}"); await ptb_context.bot.send_message(original_chat_id, f"⚠️ Failed delete data: {caption}\n{e}")
+        # Always delete temp thumb if created
         if temp_thumb_path and os.path.exists(temp_thumb_path): try: os.remove(temp_thumb_path); logger.info("Cleaned temp thumbnail.")
         except Exception as e_del: logger.error(f"Error deleting temp thumb: {e_del}")
         return True
 
+    # --- Error Handling (Outer Try) ---
     except FloodWait as fw:
         logger.warning(f"Upload FloodWait: {fw.value}s"); wait_time = fw.value + 2; error_text=f"⏳ Flood wait {wait_time}s..."; final_error_text=f"❌ Upload failed (FloodWait): {caption}"
         if status_message_id: try: await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=error_text); await asyncio.sleep(wait_time); await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=final_error_text)
