@@ -2,7 +2,7 @@
 # Contains general utility functions for the bot, including file operations, splitting, and styling.
 
 import os
-import re # Make sure re is imported
+import re
 import urllib.parse
 import logging
 import math
@@ -22,7 +22,8 @@ TARGET_SPLIT_SIZE_MB = 1800 # Target for calculation (used by dynamic duration)
 TARGET_SPLIT_SIZE_BYTES = TARGET_SPLIT_SIZE_MB * 1024 * 1024
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".mpeg", ".mpg"}
-FFMPEG_SEGMENT_DURATION = 900 # Default 15 mins for fixed-time split attempt (Adjust if needed)
+# Choose a segment duration for ffmpeg splitting (in seconds). This is now calculated dynamically.
+# FFMPEG_SEGMENT_DURATION = 900 # No longer used directly
 
 
 # --- Helper to run FFmpeg/FFprobe commands ---
@@ -45,7 +46,7 @@ async def _run_command(cmd_list, command_name="command"):
         logger.error(f"{command_name} failed (code {return_code}):\n{cmd_str}\nError:\n{error_output}")
         return False, error_output
     else:
-        if error_output: logger.info(f"{command_name} stderr output:\n{error_output}") # Log potential warnings/info
+        if error_output: logger.info(f"{command_name} stderr output:\n{error_output}")
         logger.info(f"{command_name} command finished successfully.")
         return True, output
 
@@ -80,7 +81,7 @@ async def _split_video_dynamic_duration(original_path, context: ContextTypes.DEF
     # 2. Calculate Segment Duration
     target_size_bits = TARGET_SPLIT_SIZE_BYTES * 8
     calculated_duration = int(target_size_bits / bitrate)
-    segment_duration = max(10, calculated_duration)
+    segment_duration = max(10, calculated_duration) # Min 10 sec duration
     logger.info(f"Calculated target segment duration: {segment_duration} seconds (aiming for ~{TARGET_SPLIT_SIZE_MB}MB)")
 
     if duration_from_probe and segment_duration >= duration_from_probe:
@@ -94,7 +95,7 @@ async def _split_video_dynamic_duration(original_path, context: ContextTypes.DEF
 
     logger.info(f"Starting ffmpeg video split for: {base_filename}")
     if context and chat_id:
-        try: await context.bot.send_message(chat_id, f"✂️ Splitting video '{base_filename}'...")
+        try: await context.bot.send_message(chat_id, f"✂️ Splitting video '{base_filename}' (target ~{TARGET_SPLIT_SIZE_MB}MB parts)...")
         except Exception: pass
 
     # 4. Run FFmpeg
@@ -144,7 +145,7 @@ async def split_if_needed(original_path, context: ContextTypes.DEFAULT_TYPE | No
             d_dir = context.bot_data.get('download_dir', '/content') if context else '/content'
             logger.warning(f"Large file '{base_filename}' ({file_size/1024/1024:.1f}MB) in {d_dir} cannot split (not video or mode '{upload_mode}').")
             if context and chat_id:
-                 try: await context.bot.send_message(chat_id, f"⚠️ File '{base_filename}' too large & cannot split for mode '{upload_mode}'.")
+                 try: await context.bot.send_message(chat_id, f"⚠️ File '{base_filename}' too large & cannot be split for mode '{upload_mode}'.")
                  except Exception: pass
             return None
     except Exception as e:
@@ -155,10 +156,9 @@ async def split_if_needed(original_path, context: ContextTypes.DEFAULT_TYPE | No
         return None
 
 
-# --- Cleanup Utility (Unchanged) ---
+# --- Cleanup Utility ---
 async def cleanup_split_parts(original_path, parts):
     """Deletes split parts and their directory, and optionally the original file."""
-    # ... (function body unchanged) ...
     if not parts or len(parts) <= 1: logger.debug(f"Cleanup skipped {original_path}."); return
     parts_dir = os.path.dirname(parts[0]); logger.info(f"Cleaning up {len(parts)} parts in {parts_dir}"); deleted_parts_count = 0
     try:
@@ -170,29 +170,27 @@ async def cleanup_split_parts(original_path, parts):
         if os.path.isdir(parts_dir):
              try: os.rmdir(parts_dir); logger.info(f"Removed parts dir: {parts_dir}")
              except OSError as e_dir: logger.warning(f"Could not remove parts dir {parts_dir}: {e_dir}")
+        # Only delete original if splitting definitely occurred (more than 1 part generated/returned)
         if os.path.exists(original_path) and len(parts) > 1:
              try: os.remove(original_path); logger.info(f"Deleted original: {original_path}")
              except Exception as e_orig: logger.error(f"Failed delete original {original_path}: {e_orig}")
     except Exception as e: logger.error(f"Error cleanup {original_path}: {e}", exc_info=True)
 
 
-# --- Existing File/String Utilities ---
+# --- File/String Utilities ---
 def write_failed_downloads_to_file(failed_items, downloader_name, download_directory):
-    # ... (function body unchanged) ...
     if not failed_items: return None
     file_path = os.path.join(download_directory, f"failed_downloads_{downloader_name}.txt")
     try: os.makedirs(download_directory, exist_ok=True); f=open(file_path, "w"); f.write(f"# Failed URLs for {downloader_name}\n"); [f.write(f"{item}\n") for item in failed_items]; f.close(); logger.info(f"Failed list saved: {file_path}"); return file_path
     except Exception as e: logger.error(f"Error writing failed file: {e}"); return None
 
 def clean_filename(filename):
-    # ... (function body unchanged) ...
     try: filename = urllib.parse.unquote(filename, encoding='utf-8', errors='replace')
     except Exception: pass
     filename = filename.replace('%20', ' '); cleaned_filename = re.sub(r'[\\/:*?"<>|\[\]]', '_', filename) # Added brackets here too
     cleaned_filename = re.sub(r'_+', '_', cleaned_filename); cleaned_filename = cleaned_filename.strip('._ '); cleaned_filename = cleaned_filename[:250]; return cleaned_filename if cleaned_filename else "downloaded_file"
 
 def extract_filename_from_url(url):
-    # ... (function body unchanged) ...
     try:
         if not isinstance(url, str) or not url.lower().startswith(('http://', 'https://')): logger.warning(f"Skip invalid URL: {str(url)[:100]}"); return None
         parsed_url = urllib.parse.urlparse(url); path = parsed_url.path; filename_raw = os.path.basename(path)
@@ -201,17 +199,8 @@ def extract_filename_from_url(url):
         decoded_filename = urllib.parse.unquote(filename_raw, encoding='utf-8', errors='replace'); return clean_filename(decoded_filename)
     except Exception as e: logger.warning(f"Error extracting FN from {url}: {e}"); return None
 
-# --- NEW: Filename Styling Function ---
 def apply_dot_style(filename):
     """Applies a specific style replacing common separators with dots."""
-    # Replace sequences of space, underscore, or hyphen with a single dot
-    # Includes underscores that might result from clean_filename's replacements
-    styled_name = re.sub(r'[ _-]+', '.', filename)
-    # Remove any remaining brackets just in case (clean_filename should handle)
-    styled_name = styled_name.replace('[', '').replace(']', '')
-    # Collapse multiple dots into one
-    styled_name = re.sub(r'\.+', '.', styled_name)
-    # Remove leading/trailing dots
-    styled_name = styled_name.strip('.')
-    # Ensure filename is not empty after styling
+    styled_name = re.sub(r'[ _-]+', '.', filename); styled_name = styled_name.replace('[', '').replace(']', '')
+    styled_name = re.sub(r'\.+', '.', styled_name); styled_name = styled_name.strip('.')
     return styled_name if styled_name else "styled_file"
