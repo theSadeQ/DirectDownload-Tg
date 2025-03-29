@@ -1,219 +1,176 @@
-
-# handlers.py
-# Contains PTB handlers, conversation logic, and the reporting helper.
-# Force written by Cell 3 to ensure correctness.
+# upload.py
+# Handles the file upload using Pyrogram.
+# Gets config via context. Edits progress via pyro client. Downloads thumb URL.
+# FIXED: SyntaxError in except block before fallback.
 
 import logging
+import os
+import time
 import asyncio
-import io
+import tempfile
+import requests
 
-# PTB imports
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ContextTypes,
-    ConversationHandler,
-    CallbackQueryHandler,
-    CommandHandler,
-    MessageHandler,
-    filters
-)
-from telegram.constants import ParseMode
+# Import Pyrogram types/errors
+from pyrogram import Client
+from pyrogram.errors import FloodWait, MediaCaptionTooLong, BadRequest, BotMethodInvalid
 
-# Import utils
-try:
-    from utils import (
-        extract_filename_from_url,
-        clean_filename,
-        write_failed_downloads_to_file,
-        apply_dot_style
-    )
-except ImportError as e:
-    logging.basicConfig(level=logging.ERROR)
-    logging.error(f"Failed import from utils.py: {e}")
-    raise
-
-# Import downloaders
-try:
-    from downloaders import (
-        download_files_nzbcloud,
-        download_multiple_files_deltaleech,
-        download_multiple_files_bitso
-    )
-except ImportError as e:
-    logging.error(f"Failed import from downloaders.py: {e}")
-    raise
+# Import PTB types/errors
+from telegram import Update
+from telegram.ext import ContextTypes
+from telegram.error import BadRequest as PTBBadRequest
 
 logger = logging.getLogger(__name__)
 
-# --- Conversation States ---
-CHOOSE_DOWNLOADER, GET_URLS, GET_FILENAMES_NZB, \
-GET_FILENAMES_DELTA, CONFIRM_DELTA_FN, \
-GET_URLS_BITSO, CONFIRM_BITSO_FN, GET_FILENAMES_BITSO = range(8)
-
-# --- Helper for Running and Reporting ---
-async def run_and_report_process(update: Update, context: ContextTypes.DEFAULT_TYPE, download_upload_task, service_name: str):
-    chat_id = update.effective_chat.id; failed_sources = []
-    download_dir = context.bot_data.get('download_dir', '/content/downloads')
+# --- Helper Function to Download Thumbnail ---
+async def _download_thumb(url: str) -> str | None:
+    # ... (function unchanged) ...
+    temp_thumb_path = None
     try:
-        failed_sources = await download_upload_task
-        final_msg = f"🏁 <b>{service_name}</b> process finished."
-        logger.info(f"{service_name} process OK for chat {chat_id}.")
-        if failed_sources:
-            final_msg += f"\n⚠️ Failed {len(failed_sources)} item(s)."
-            logger.warning(f"{len(failed_sources)} failure(s) for {service_name} in {chat_id}.")
-            failed_file_path = write_failed_downloads_to_file(failed_sources, service_name, download_dir)
-            if failed_file_path:
-                 escaped_path = failed_file_path.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                 final_msg += f"\nList saved to <pre>{escaped_path}</pre>"
-        else:
-            final_msg += f"\n✅🎉 All items OK!"
-            logger.info(f"All {service_name} OK for {chat_id}.")
-        await context.bot.send_message(chat_id, final_msg, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        logger.error(f"Error run/report {service_name}: {e}", exc_info=True)
-        try:
-            error_text = str(e).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-            await context.bot.send_message(chat_id, f"🚨 Error after <b>{service_name}</b>.\nError: <pre>{error_text[:500]}</pre>", parse_mode=ParseMode.HTML)
-        except Exception as send_error: logger.error(f"Failed send final error msg {chat_id}: {send_error}")
+        response = await asyncio.to_thread(requests.get, url, stream=True, timeout=10); response.raise_for_status()
+        content_type = response.headers.get('content-type')
+        if not content_type or not content_type.startswith('image/'): logger.warning(f"Thumb URL not image: {content_type} ({url})"); return None
+        suffix = ".jpg";
+        if 'png' in content_type: suffix = ".png"; elif 'webp' in content_type: suffix = ".webp"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            for chunk in response.iter_content(chunk_size=8192): temp_file.write(chunk)
+            temp_thumb_path = temp_file.name; logger.info(f"Thumb downloaded to temp: {temp_thumb_path}")
+    except requests.exceptions.RequestException as e: logger.error(f"Failed DL thumb URL {url}: {e}"); temp_thumb_path = None
+    except Exception as e: logger.error(f"Unexpected thumb DL error {url}: {e}", exc_info=True); temp_thumb_path = None
+    finally:
+        if 'response' in locals() and response: response.close()
+    return temp_thumb_path
 
-# --- Simple Command Handlers ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user; upload_enabled = context.bot_data.get('upload_enabled', True); upload_mode = context.bot_data.get('upload_mode', 'N/A'); delete_after_upload = context.bot_data.get('delete_after_upload', True)
-    cred_status = "API/Token Configured." if context.bot_data.get('pyrogram_client') else "⚠️ API/Token Error!"; upload_status = f"✅ Uploads ON (Mode: {upload_mode})." if upload_enabled else "ℹ️ Uploads OFF."; delete_status = f"🗑️ Delete ON." if upload_enabled and delete_after_upload else "💾 Delete OFF."
-    await update.message.reply_html(rf"Hi {user.mention_html()}!\n\n{cred_status}\n{upload_status}\n{delete_status}\n\nUse /download to start.",)
+# --- Main Upload Function ---
+async def upload_file_pyrogram(
+    pyrogram_client: Client,
+    ptb_update: Update,
+    ptb_context: ContextTypes.DEFAULT_TYPE,
+    file_path: str,
+    caption: str
+):
+    """ Uploads file using Pyrogram, downloads thumbnail, edits progress via pyro client. """
+    upload_enabled = ptb_context.bot_data.get('upload_enabled', True); upload_mode = ptb_context.bot_data.get('upload_mode', 'Document'); delete_after_upload = ptb_context.bot_data.get('delete_after_upload', True); target_chat_id = ptb_context.bot_data.get('target_chat_id'); thumbnail_url = ptb_context.bot_data.get('thumbnail_url')
+    if not upload_enabled: logger.info(f"Upload skipped (disabled): {os.path.basename(file_path)}"); await ptb_context.bot.send_message(ptb_update.effective_chat.id, f"ℹ️ Skip: {caption}"); return True
+    original_chat_id = ptb_update.effective_chat.id; upload_destination_chat_id = target_chat_id if target_chat_id and isinstance(target_chat_id, int) and target_chat_id != 0 else original_chat_id
+    logger.info(f"Upload destination: {upload_destination_chat_id}"); base_filename = os.path.basename(file_path); upload_start_time = time.time(); last_update_time = 0
+    status_message = None; status_message_id = None; upload_mode_str = upload_mode
+    max_caption_length = 1024;
+    if len(caption) > max_caption_length: caption = caption[:max_caption_length - 4] + "..."
+    temp_thumb_path = None; thumb_to_use = None
+    if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.startswith(('http://', 'https://')):
+        logger.info(f"Attempting DL thumb: {thumbnail_url}"); temp_thumb_path = await _download_thumb(thumbnail_url)
+        if temp_thumb_path: thumb_to_use = temp_thumb_path
+        else: logger.warning("Failed DL thumb.")
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id if update.effective_user else "Unknown"; logger.info(f"User {user_id} cancelled.")
-    message_text = "Download process cancelled."; query = update.callback_query
     try:
-        if query: await query.answer(); await query.edit_message_text(message_text)
-        elif update.message: await update.message.reply_text(message_text)
+        try: status_message = await ptb_context.bot.send_message(original_chat_id, f"⏫ Prep {upload_mode_str.lower()} up: {caption}..."); status_message_id = status_message.message_id; logger.info(f"Pyro Start {upload_mode_str} '{base_filename}' -> {upload_destination_chat_id}. Status: {status_message_id} in {original_chat_id}")
+        except Exception as e: logger.error(f"Failed init status msg: {e}"); status_message_id = None
+
+        async def progress(current, total):
+            # ... (progress callback exactly as in previous correct version) ...
+            nonlocal last_update_time, status_message_id, pyrogram_client
+            if not status_message_id: return
+            try:
+                now = time.time(); throttle_interval = 6
+                if now - last_update_time < throttle_interval: return
+                percent_str = f"{round((current/total)*100,1)}%" if total>0 else "??%"; elapsed_time=now-upload_start_time; speed=current/elapsed_time if elapsed_time>0 else 0; speed_str=f"{speed/1024/1024:.2f}MB/s" if speed>0 else "N/A"; eta_str="N/A"
+                if total>0 and speed>0: eta=((total-current)/speed); eta_str=time.strftime("%H:%M:%S",time.gmtime(eta)) if eta>=0 else "N/A"
+                bar_len=10; filled_len = min(bar_len, int(bar_len*current/total)) if total>0 and current>=0 else 0; bar='█'*filled_len+'░'*(bar_len-filled_len); size_str=f"{(current/1024/1024):.1f}MB{' / '+str(round(total/1024/1024,1))+'MB' if total > 0 else ''}"
+                progress_text = f"⏫ Upload ({upload_mode_str}): {caption}\n[{bar}] {percent_str}\n{size_str}\nSpeed: {speed_str}|ETA: {eta_str}"
+                try: await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=progress_text); last_update_time = now
+                except FloodWait as fw: logger.warning(f"Pyro prog FloodWait: {fw.value}s"); await asyncio.sleep(fw.value+1); last_update_time=time.time()+fw.value
+                except BadRequest as py_e:
+                    if "MODIFIED" in str(py_e): pass
+                    elif "INVALID" in str(py_e) or "not found" in str(py_e).lower(): logger.warning(f"Status msg gone (Pyro). Stop edits."); status_message_id = None
+                    else: logger.error(f"Edit progress err (Pyro): {py_e}")
+                except Exception as e: logger.error(f"Unexpected prog edit err (Pyro): {e}", exc_info=False)
+            except Exception as e: logger.error(f"Critical prog cb err: {e}", exc_info=True)
+
+        sent_message = None; upload_func = None
+        kwargs = {'chat_id': upload_destination_chat_id, 'caption': caption, 'progress': progress}
+        if thumb_to_use: kwargs['thumb'] = thumb_to_use
+        attempted_mode = upload_mode_str
+
+        if upload_mode_str == "Video": upload_func = pyrogram_client.send_video; kwargs['video'] = file_path; kwargs['supports_streaming'] = True
+        elif upload_mode_str == "Audio": upload_func = pyrogram_client.send_audio; kwargs['audio'] = file_path
+        else: attempted_mode = "Document"; upload_func = pyrogram_client.send_document; kwargs['document'] = file_path; kwargs['force_document'] = True
+
+        try: # Inner try for upload/fallback
+            logger.info(f"Attempt {attempted_mode} up -> {upload_destination_chat_id} (T:{'Y' if thumb_to_use else 'N'})...")
+            if status_message_id: await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=f"⏫ Upload ({attempted_mode})...")
+            sent_message = await upload_func(**kwargs)
+            logger.info(f"Success upload {attempted_mode} -> {upload_destination_chat_id}.")
+            upload_mode_str = attempted_mode
+        # ***** CORRECTED EXCEPTION BLOCK *****
+        except (MediaCaptionTooLong, BadRequest, BotMethodInvalid, TimeoutError, ValueError) as e:
+            logger.error(f"Pyro err {attempted_mode} -> {upload_destination_chat_id}: {e}. Fallback...")
+            # Edit status message *before* fallback attempt (INDENTED under if)
+            if status_message_id:
+                try:
+                    await pyrogram_client.edit_message_text(
+                        chat_id=original_chat_id,
+                        message_id=status_message_id,
+                        text=f"⚠️ {attempted_mode} fail: {str(e)[:100]}. Fallback..."
+                    )
+                except Exception as edit_err:
+                     logger.error(f"Failed edit during fallback notify: {edit_err}")
+            # Attempt fallback
+            if attempted_mode != "Document":
+                try:
+                    logger.info("Attempt fallback Document..."); kwargs.pop('video', None); kwargs.pop('audio', None); kwargs.pop('supports_streaming', None); kwargs['document'] = file_path; kwargs['force_document'] = True
+                    if status_message_id: await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=f"⏫ Upload (Fallback)...")
+                    sent_message = await pyrogram_client.send_document(**kwargs) # Fallback upload
+                    upload_mode_str = "Document (Fallback)"; logger.info("Fallback success.")
+                except Exception as fallback_e:
+                    logger.error(f"Fallback failed: {fallback_e}", exc_info=True); sent_message = None
+                    # Edit status after fallback failure (INDENTED under this inner except)
+                    if status_message_id:
+                        try: await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=f"❌ Fallback fail: {str(fallback_e)[:100]}")
+                        except Exception: pass # Ignore final edit error
+            else: # Original attempt was Document and it failed
+                 logger.error(f"Doc upload failed: {e}", exc_info=True); sent_message = None
+                 # Edit status after document failure (INDENTED under this else)
+                 if status_message_id:
+                      try: await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=f"❌ Document fail: {str(e)[:100]}")
+                      except Exception: pass # Ignore final edit error
+        # ***** END CORRECTED EXCEPTION BLOCK *****
+
+        # --- Check Success / Final Status / Cleanup ---
+        if not sent_message: # Check upload success
+            logger.error(f"Upload failed {base_filename}. Mode: {upload_mode_str}"); final_error_text = f"❌ Upload failed ({upload_mode_str}): {caption}"
+            # Edit/send failure message
+            if status_message_id: try: await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=final_error_text)
+            except Exception: await pyrogram_client.send_message(chat_id=original_chat_id, text=final_error_text)
+            elif original_chat_id: await pyrogram_client.send_message(chat_id=original_chat_id, text=final_error_text)
+            # Cleanup temp thumb on failure
+            if temp_thumb_path and os.path.exists(temp_thumb_path): try: os.remove(temp_thumb_path); logger.info("Cleaned temp thumb after fail.")
+            except Exception as e_del: logger.error(f"Error deleting temp thumb after fail: {e_del}")
+            return False
+        # Final Success Message
+        final_message = f"✅ Upload OK ({upload_mode_str}): {caption}"; logger.info(f"Upload finish: '{base_filename}' ({upload_mode_str}) -> {upload_destination_chat_id}")
+        if upload_destination_chat_id != original_chat_id: final_message += f"\n(Sent -> ID: {upload_destination_chat_id})"
+        if status_message_id: try: await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=final_message)
+        except Exception: await pyrogram_client.send_message(original_chat_id, final_message)
+        elif original_chat_id: await pyrogram_client.send_message(original_chat_id, final_message)
+        # Delete Local File(s)
+        if delete_after_upload:
+             try: os.remove(file_path); logger.info(f"Deleted data: {file_path}"); await ptb_context.bot.send_message(original_chat_id, f"🗑️ Local data deleted: {caption}", disable_notification=True)
+             except OSError as e: logger.error(f"Failed delete {file_path}: {e}"); await ptb_context.bot.send_message(original_chat_id, f"⚠️ Failed delete data: {caption}\n{e}")
+        # Always delete temp thumb if created
+        if temp_thumb_path and os.path.exists(temp_thumb_path): try: os.remove(temp_thumb_path); logger.info("Cleaned temp thumbnail.")
+        except Exception as e_del: logger.error(f"Error deleting temp thumb: {e_del}")
+        return True
+
+    # --- Error Handling (Outer Try) ---
+    except FloodWait as fw:
+        logger.warning(f"Upload FloodWait: {fw.value}s"); wait_time = fw.value + 2; error_text=f"⏳ Flood wait {wait_time}s..."; final_error_text=f"❌ Upload failed (FloodWait): {caption}"
+        if status_message_id: try: await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=error_text); await asyncio.sleep(wait_time); await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=final_error_text)
+        except Exception: await pyrogram_client.send_message(original_chat_id, final_error_text)
+        elif original_chat_id: await pyrogram_client.send_message(original_chat_id, error_text); await asyncio.sleep(wait_time); await pyrogram_client.send_message(original_chat_id, final_error_text)
+        logger.error(f"Upload stopped (FloodWait): {base_filename}."); if temp_thumb_path and os.path.exists(temp_thumb_path): try: os.remove(temp_thumb_path) except Exception: pass; return False
     except Exception as e:
-        logger.warning(f"Failed send/edit cancel confirmation: {e}")
-        try: await context.bot.send_message(update.effective_chat.id, message_text)
-        except Exception as send_e: logger.error(f"Failed sending cancel confirmation fallback: {send_e}")
-    context.user_data.clear(); return ConversationHandler.END
-
-# --- Conversation Handlers ---
-async def _process_urls_and_proceed(urls: list[str], update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not urls: await update.message.reply_text("⚠️ No valid HTTP(S) URLs found."); current_downloader = context.user_data.get('downloader'); return GET_URLS_BITSO if current_downloader == 'bitso' else GET_URLS
-    context.user_data['urls'] = urls; downloader = context.user_data.get('downloader', 'N/A'); logger.info(f"Processed {len(urls)} URLs for {downloader}.")
-    if downloader == 'nzbcloud': await update.message.reply_text(f"✅ Got {len(urls)} URL(s).\nSend FN(s):"); return GET_FILENAMES_NZB
-    elif downloader == 'deltaleech': kb = [[InlineKeyboardButton("Extract FNs", callback_data='delta_use_url_fn')],[InlineKeyboardButton("Provide FNs", callback_data='delta_manual_fn')],[InlineKeyboardButton("Cancel", callback_data='cancel')]]; await update.message.reply_text(f"✅ Got {len(urls)} URL(s).\nFilenames?", reply_markup=InlineKeyboardMarkup(kb)); return CONFIRM_DELTA_FN
-    elif downloader == 'bitso': kb = [[InlineKeyboardButton("Yes, from URLs", callback_data='bitso_use_url_fn')],[InlineKeyboardButton("No, provide", callback_data='bitso_manual_fn')],[InlineKeyboardButton("Cancel", callback_data='cancel')]]; await update.message.reply_text(f"✅ Got {len(urls)} URL(s).\nExtract filenames?", reply_markup=InlineKeyboardMarkup(kb)); return CONFIRM_BITSO_FN
-    else: logger.error(f"Unknown downloader '{downloader}'."); await update.message.reply_text("Internal error."); return ConversationHandler.END
-
-async def start_download_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-     if 'pyrogram_client' not in context.bot_data: await update.message.reply_text("⚠️ Bot init error."); return ConversationHandler.END
-     kb = [[InlineKeyboardButton(s, callback_data=s.lower().split()[1]) for s in ["☁️ nzbCloud", "💧 DeltaLeech", "🪙 Bitso"]], [InlineKeyboardButton("❌ Cancel", callback_data='cancel')]]
-     await update.message.reply_text("Choose service:", reply_markup=InlineKeyboardMarkup(kb)); return CHOOSE_DOWNLOADER
-
-async def choose_downloader(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query; await query.answer(); downloader = query.data; context.user_data['downloader'] = downloader; logger.info(f"User {update.effective_user.id} chose: {downloader}");
-    if downloader == 'cancel': return await cancel(update, context)
-    message_text = f"Selected: <b>{downloader}</b>\nSend URL(s) (one per line or upload .txt):"; await query.edit_message_text(message_text, parse_mode=ParseMode.HTML)
-    if downloader in ['nzbcloud', 'deltaleech']: return GET_URLS
-    elif downloader == 'bitso': return GET_URLS_BITSO
-    else: await query.edit_message_text("Error."); return ConversationHandler.END
-
-async def get_urls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    logger.info("Handling text in GET_URLS."); urls = [url for url in update.message.text.splitlines() if url.strip().lower().startswith(('http://', 'https://'))]; return await _process_urls_and_proceed(urls, update, context)
-async def get_urls_bitso(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    logger.info("Handling text in GET_URLS_BITSO."); urls = [url for url in update.message.text.splitlines() if url.strip().lower().startswith(('http://', 'https://'))]; return await _process_urls_and_proceed(urls, update, context)
-async def handle_url_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    logger.info("Handling document."); doc = update.message.document; current_downloader = context.user_data.get('downloader'); current_state = GET_URLS_BITSO if current_downloader == 'bitso' else GET_URLS
-    if not doc or not doc.file_name or not doc.file_name.lower().endswith(".txt"): await update.message.reply_text("Please upload `.txt` file."); return current_state
-    MAX_TXT_SIZE = 1*1024*1024;
-    if doc.file_size > MAX_TXT_SIZE: await update.message.reply_text(f"❌ File >{MAX_TXT_SIZE/1024/1024:.0f}MB."); return current_state
-    try: txt_file = await context.bot.get_file(doc.file_id); file_content_bytes = await txt_file.download_as_bytearray(); file_content_str = file_content_bytes.decode('utf-8')
-    except UnicodeDecodeError: await update.message.reply_text("❌ Error decoding file as UTF-8."); return current_state
-    except Exception as e: logger.error(f"Error processing URL file: {e}", exc_info=True); await update.message.reply_text(f"❌ Error processing file: {e}"); return current_state
-    urls = [url for url in file_content_str.splitlines() if url.strip().lower().startswith(('http://', 'https://'))]; logger.info(f"Extracted {len(urls)} URLs from '{doc.file_name}'."); return await _process_urls_and_proceed(urls, update, context)
-
-async def confirm_delta_filenames(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query; await query.answer(); choice = query.data; urls = context.user_data['urls']
-    if choice == 'cancel': return await cancel(update, context)
-    if choice == 'delta_use_url_fn':
-        logger.info("Extracting FNs for Delta."); fns = [extract_filename_from_url(url) for url in urls]; failed = [u for u,f in zip(urls,fns) if f is None]; valid = [f for f in fns if f]
-        if not valid: await query.edit_message_text("⚠️ No FNs extracted. Provide manually:", parse_mode=ParseMode.HTML); context.user_data['use_url_filenames'] = False; return GET_FILENAMES_DELTA
-        elif failed: await query.edit_message_text(f"⚠️ Failed {len(failed)} FNs (e.g., <pre>{failed[0]}</pre>). Provide ALL manually:", parse_mode=ParseMode.HTML); context.user_data['use_url_filenames'] = False; return GET_FILENAMES_DELTA
-        else: context.user_data['filenames'] = valid; logger.info(f"Using {len(valid)} extracted FNs."); await query.edit_message_text("✅ Using extracted FNs.\n⏳ Starting Delta (cf=None)...", parse_mode=ParseMode.HTML); cf = None; pyro_client = context.bot_data.get('pyrogram_client')
-        if not pyro_client: await context.bot.send_message(update.effective_chat.id, "🚨 Error: Cannot upload.")
-        else: asyncio.create_task(run_and_report_process(update, context, download_multiple_files_deltaleech(urls, valid, cf, update, context, pyro_client), "deltaleech"))
-        context.user_data.clear(); return ConversationHandler.END
-    elif choice == 'delta_manual_fn': context.user_data['use_url_filenames'] = False; await query.edit_message_text(f"Send {len(urls)} FN(s) (one per line):"); return GET_FILENAMES_DELTA
-    else: return ConversationHandler.END
-
-async def get_filenames_delta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    fns_raw=[fn.strip() for fn in update.message.text.splitlines() if fn.strip()]; urls=context.user_data['urls']
-    if not fns_raw: await update.message.reply_text("⚠️ No FNs. Send again or /cancel."); return GET_FILENAMES_DELTA
-    if len(urls)!=len(fns_raw): await update.message.reply_text(f"❌ Error: {len(fns_raw)} FNs != {len(urls)} URLs."); return GET_FILENAMES_DELTA
-    cleaned_fns = [clean_filename(fn) for fn in fns_raw]; styled_fns = [apply_dot_style(fn) for fn in cleaned_fns] # Apply style
-    context.user_data['filenames']=styled_fns; logger.info(f"Got {len(styled_fns)} manual styled FNs for delta: {styled_fns[:3]}...")
-    await update.message.reply_text("✅ Got styled filenames.\n⏳ Starting Delta (cf=None)...")
-    cf=None; pyro_client=context.bot_data.get('pyrogram_client')
-    if not pyro_client: await update.message.reply_text("🚨 Error: Cannot upload.")
-    else: asyncio.create_task(run_and_report_process(update, context, download_multiple_files_deltaleech(urls, styled_fns, cf, update, context, pyro_client), "deltaleech")) # Use styled_fns
-    context.user_data.clear(); return ConversationHandler.END
-
-async def get_filenames_nzb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    fns_raw=[fn.strip() for fn in update.message.text.splitlines() if fn.strip()]; urls=context.user_data['urls']
-    if not fns_raw: await update.message.reply_text("⚠️ No FNs. Send again or /cancel."); return GET_FILENAMES_NZB
-    if len(urls)!=len(fns_raw): await update.message.reply_text(f"❌ Error: {len(fns_raw)} FNs != {len(urls)} URLs."); return GET_FILENAMES_NZB
-    cleaned_fns = [clean_filename(fn) for fn in fns_raw]; styled_fns = [apply_dot_style(fn) for fn in cleaned_fns] # Apply style
-    context.user_data['filenames']=styled_fns; logger.info(f"Got {len(styled_fns)} styled FNs for nzb: {styled_fns[:3]}...")
-    await update.message.reply_text("✅ Got styled filenames.\n⏳ Starting nzbCloud (cf=None)...")
-    cf=None; pyro_client=context.bot_data.get('pyrogram_client')
-    if not pyro_client: await update.message.reply_text("🚨 Error: Cannot upload.")
-    else: asyncio.create_task(run_and_report_process(update, context, download_files_nzbcloud(urls, styled_fns, cf, update, context, pyro_client), "nzbcloud")) # Use styled_fns
-    context.user_data.clear(); return ConversationHandler.END
-
-async def confirm_bitso_filenames(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query; await query.answer(); choice = query.data; urls = context.user_data['urls']
-    if choice == 'cancel': return await cancel(update, context)
-    if choice == 'bitso_use_url_fn':
-        logger.info("Attempting to extract filenames from URLs for Bitso."); filenames = [extract_filename_from_url(url) for url in urls]; failed = [u for u,f in zip(urls,filenames) if f is None]; valid = [f for f in filenames if f is not None]
-        if not valid: await query.edit_message_text("⚠️ Could not extract FNs. Provide manually:", parse_mode=ParseMode.HTML); return GET_FILENAMES_BITSO
-        elif failed: await query.edit_message_text(f"⚠️ Failed {len(failed)} FNs (e.g.,<pre>{failed[0]}</pre>). Provide ALL manually:", parse_mode=ParseMode.HTML); return GET_FILENAMES_BITSO
-        else: context.user_data['filenames'] = valid; logger.info(f"Using {len(valid)} extracted FNs for Bitso."); await query.edit_message_text("✅ Using extracted FNs.\n⏳ Starting Bitso (cookies=None)...", parse_mode=ParseMode.HTML); id_c=None; sess_c=None; ref_url="https://panel.bitso.ir/"; pyro_client = context.bot_data.get('pyrogram_client')
-        if not pyro_client: await context.bot.send_message(update.effective_chat.id, "🚨 Error: Cannot upload.")
-        else: asyncio.create_task(run_and_report_process(update, context, download_multiple_files_bitso(urls, valid, ref_url, id_c, sess_c, update, context, pyro_client), "bitso"))
-        context.user_data.clear(); return ConversationHandler.END
-    elif choice == 'bitso_manual_fn': await query.edit_message_text(f"OK. Send the {len(urls)} filename(s), one per line, matching the URL order, or /cancel."); return GET_FILENAMES_BITSO
-    else: return ConversationHandler.END
-
-async def get_filenames_bitso(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    fns_raw=[fn.strip() for fn in update.message.text.splitlines() if fn.strip()]; urls=context.user_data['urls']
-    if not fns_raw: await update.message.reply_text("⚠️ No FNs received. Send again or /cancel."); return GET_FILENAMES_BITSO
-    if len(urls)!=len(fns_raw): await update.message.reply_text(f"❌ Error: {len(fns_raw)} FNs != {len(urls)} URLs."); return GET_FILENAMES_BITSO
-    cleaned_fns = [clean_filename(fn) for fn in fns_raw]; styled_fns = [apply_dot_style(fn) for fn in cleaned_fns] # Apply style
-    context.user_data['filenames']=styled_fns; logger.info(f"Got {len(styled_fns)} manual styled FNs for Bitso: {styled_fns[:3]}...")
-    await update.message.reply_text("✅ Got styled filenames.\n⏳ Starting Bitso process (cookies=None)...")
-    id_c=None; sess_c=None; ref_url="https://panel.bitso.ir/"; pyro_client=context.bot_data.get('pyrogram_client')
-    if not pyro_client: await update.message.reply_text("🚨 Error: Cannot upload.")
-    else: asyncio.create_task(run_and_report_process(update, context, download_multiple_files_bitso(urls, styled_fns, ref_url, id_c, sess_c, update, context, pyro_client), "bitso")) # Use styled_fns
-    context.user_data.clear(); return ConversationHandler.END
-
-# --- Build Conversation Handler ---
-conv_handler = ConversationHandler(
-    entry_points=[CommandHandler("download", start_download_conv)],
-    states={
-        CHOOSE_DOWNLOADER: [CallbackQueryHandler(choose_downloader, pattern='^(nzbcloud|deltaleech|bitso|cancel)$')],
-        GET_URLS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_urls), MessageHandler(filters.Document.TXT, handle_url_file),],
-        CONFIRM_DELTA_FN: [CallbackQueryHandler(confirm_delta_filenames, pattern='^(delta_use_url_fn|delta_manual_fn|cancel)$')],
-        GET_FILENAMES_NZB: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_filenames_nzb)],
-        GET_FILENAMES_DELTA: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_filenames_delta)],
-        GET_URLS_BITSO: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_urls_bitso), MessageHandler(filters.Document.TXT, handle_url_file),],
-        CONFIRM_BITSO_FN: [CallbackQueryHandler(confirm_bitso_filenames, pattern='^(bitso_use_url_fn|bitso_manual_fn|cancel)$')],
-        GET_FILENAMES_BITSO: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_filenames_bitso)],
-    },
-    fallbacks=[
-        CommandHandler("cancel", cancel), CallbackQueryHandler(cancel, pattern='^cancel$'),
-        MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, lambda u,c: u.message.reply_text("Unexpected file. /cancel?")),
-        MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u,c: u.message.reply_text("Unexpected input. /cancel?")),
-        MessageHandler(filters.COMMAND, lambda u,c: u.message.reply_text("Finish or /cancel first.")),
-    ],
-)
-
-# Print success message for Colab %%writefile magic
-print("handlers.py written successfully.")
+        logger.error(f"Unexpected upload error '{base_filename}': {e}", exc_info=True); error_message = f"❌ Upload failed ({upload_mode_str}): {caption}\nError: {str(e)[:200]}"
+        if status_message_id: try: await pyrogram_client.edit_message_text(chat_id=original_chat_id, message_id=status_message_id, text=error_message)
+        except Exception: await pyrogram_client.send_message(original_chat_id, error_message)
+        elif original_chat_id: await pyrogram_client.send_message(original_chat_id, error_message)
+        if temp_thumb_path and os.path.exists(temp_thumb_path): try: os.remove(temp_thumb_path) except Exception: pass; return False
